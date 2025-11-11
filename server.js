@@ -540,6 +540,32 @@ app.get('/api/reports/dwm', async (req, res) => {
 
 // Time Log Report - Get time tracking data (REMOVED DUPLICATE - using task_timesheet table instead)
 
+// Helper to format attendance timestamps consistently for clients
+const formatAttendanceDate = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  let date;
+
+  if (value instanceof Date) {
+    date = value;
+  } else {
+    const parsed = new Date(value);
+    if (!Number.isNaN(parsed.getTime())) {
+      date = parsed;
+    }
+  }
+
+  if (!date) {
+    return typeof value === 'string' ? value : null;
+  }
+
+  return date
+    .toLocaleString('sv-SE', { timeZone: 'Asia/Karachi' })
+    .replace(' ', 'T');
+};
+
 // Attendance APIs
 // Get current status for an employee
 app.get('/api/attendance/status', async (req, res) => {
@@ -557,8 +583,22 @@ app.get('/api/attendance/status', async (req, res) => {
     const query = `SELECT * FROM attendance WHERE employee_id = ? AND date = ? AND clock_out IS NULL ORDER BY clock_in DESC LIMIT 1`;
     const [rows] = await connection.execute(query, [employee_id, today]);
     
-    const row = rows.length > 0 ? rows[0] : null;
-    res.json({ active: Boolean(row), entry: row || null });
+    let entry = null;
+
+    if (rows.length > 0) {
+      const row = rows[0];
+      entry = {
+        ...row,
+        clock_in: formatAttendanceDate(row.clock_in),
+        clock_out: formatAttendanceDate(row.clock_out)
+      };
+    }
+
+    res.json({
+      active: Boolean(entry),
+      entry,
+      totalDailyDuration: entry ? entry.duration_seconds || 0 : 0
+    });
   } catch (err) {
     console.error('Error fetching attendance status:', err);
     res.status(500).json({ error: 'Database error' });
@@ -613,14 +653,28 @@ app.post('/api/attendance/clock-in', async (req, res) => {
         'UPDATE attendance SET session_count = ?, clock_in = ?, clock_out = NULL WHERE id = ?', 
         [currentSessionCount + 1, now, todayRecord[0].id]
       );
-      res.status(200).json({ id: todayRecord[0].id, employee_id, employee_name: employeeName, date: today, clock_in: now, session_count: currentSessionCount + 1 });
+      res.status(200).json({
+        id: todayRecord[0].id,
+        employee_id,
+        employee_name: employeeName,
+        date: today,
+        clock_in: formatAttendanceDate(now),
+        session_count: currentSessionCount + 1
+      });
     } else {
       // Create new record for today
       const [result] = await connection.execute(
         'INSERT INTO attendance (employee_id, employee_name, date, clock_in, session_count) VALUES (?, ?, ?, ?, 1)', 
         [employee_id, employeeName, today, now]
       );
-      res.status(201).json({ id: result.insertId, employee_id, employee_name: employeeName, date: today, clock_in: now, session_count: 1 });
+      res.status(201).json({
+        id: result.insertId,
+        employee_id,
+        employee_name: employeeName,
+        date: today,
+        clock_in: formatAttendanceDate(now),
+        session_count: 1
+      });
     }
   } catch (err) {
     console.error('Error clocking in:', err);
@@ -703,8 +757,8 @@ app.post('/api/attendance/clock-out', async (req, res) => {
     res.json({ 
       id: row.id, 
       employee_id, 
-      clock_in: clockInTime ? clockInTime.toISOString() : row.clock_in, 
-      clock_out: nowDate ? nowDate.toISOString() : `${nowForDb.replace(' ', 'T')}`, 
+      clock_in: formatAttendanceDate(clockInTime || row.clock_in), 
+      clock_out: formatAttendanceDate(nowDate || now), 
       duration_seconds: totalDurationSeconds,
       hours_worked: totalHoursWorked,
       session_count: row.session_count || 1
@@ -6704,806 +6758,6 @@ app.post('/api/admin/reset-recurring', async (req, res) => {
     }
   }, 60 * 1000); // check every minute
 })();
-
-            // Task API Routes
-
-            // Notice Board API Routes
-
-            // Get all notices
-            app.get('/api/notices', async (req, res) => {
-              const { user_id, user_role } = req.query;
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                // Check if user is admin - admins see all notices, employees see only their assigned notices
-                let whereClause = '';
-                let queryParams = [];
-                
-                // Check if user is admin (either hardcoded admin or employee with admin role)
-                const isAdmin = (user_role && user_role.toLowerCase() === 'admin') || 
-                               (user_id === 'admin') || 
-                               (!user_id); // No user_id means show all
-                
-                if (user_id && !isAdmin) {
-                  // For non-admin users, filter notices to only show those assigned to them
-                  whereClause = `
-                    WHERE n.id IN (
-                      SELECT DISTINCT nr.notice_id 
-                      FROM notice_recipients nr 
-                      WHERE (nr.recipient_type = 'employee' AND nr.recipient_id = ?)
-                      OR (nr.recipient_type = 'department' AND nr.recipient_id IN (
-                        SELECT department FROM employees WHERE id = ?
-                      ))
-                    )
-                  `;
-                  queryParams = [user_id, user_id];
-                }
-                // For admin users or when no user_id provided, show all notices (no whereClause)
-                
-                let query;
-                if (user_id === 'admin') {
-                  // For hardcoded admin, don't join with notice_read_status
-                  query = `
-                    SELECT 
-                      n.*,
-                      CONCAT('User ', n.created_by) as created_by_name,
-                      GROUP_CONCAT(
-                        CONCAT(nr.recipient_type, ':', nr.recipient_name) 
-                        SEPARATOR '|'
-                      ) as recipients_data,
-                      GROUP_CONCAT(
-                        CONCAT(na.file_name, ':', na.file_path, ':', na.file_size, ':', na.file_type) 
-                        SEPARATOR '|'
-                      ) as attachments_data,
-                      FALSE as user_read_status,
-                      NULL as user_read_at
-                    FROM notices n
-                    LEFT JOIN notice_recipients nr ON n.id = nr.notice_id
-                    LEFT JOIN notice_attachments na ON n.id = na.notice_id
-                    ${whereClause}
-                    GROUP BY n.id
-                    ORDER BY n.created_at DESC
-                  `;
-                } else {
-                  // For other users, include read status
-                  query = `
-                    SELECT 
-                      n.*,
-                      CONCAT('User ', n.created_by) as created_by_name,
-                      GROUP_CONCAT(
-                        CONCAT(nr.recipient_type, ':', nr.recipient_name) 
-                        SEPARATOR '|'
-                      ) as recipients_data,
-                      GROUP_CONCAT(
-                        CONCAT(na.file_name, ':', na.file_path, ':', na.file_size, ':', na.file_type) 
-                        SEPARATOR '|'
-                      ) as attachments_data,
-                      nrs.is_read as user_read_status,
-                      nrs.read_at as user_read_at
-                    FROM notices n
-                    LEFT JOIN notice_recipients nr ON n.id = nr.notice_id
-                    LEFT JOIN notice_attachments na ON n.id = na.notice_id
-                    LEFT JOIN notice_read_status nrs ON n.id = nrs.notice_id AND nrs.user_id = ?
-                    ${whereClause}
-                    GROUP BY n.id
-                    ORDER BY n.created_at DESC
-                  `;
-                  // Add user_id to query params for the read status join
-                  queryParams.unshift(user_id || null);
-                }
-                
-                const [rows] = await connection.execute(query, queryParams);
-                
-                // Process the results to format recipients and attachments
-                const notices = rows.map(row => {
-                  const notice = {
-                    id: row.id,
-                    title: row.title,
-                    description: row.description,
-                    priority: row.priority,
-                    status: row.status,
-                    created_by: row.created_by,
-                    created_by_name: row.created_by_name,
-                    created_at: row.created_at,
-                    updated_at: row.updated_at,
-                    expiry_date: row.expiry_date,
-                    is_read: row.user_read_status || false,
-                    read_at: row.user_read_at,
-                    recipients: [],
-                    attachments: []
-                  };
-                  
-                  // Parse recipients
-                  if (row.recipients_data) {
-                    notice.recipients = row.recipients_data.split('|').map(recipient => {
-                      const [type, name] = recipient.split(':');
-                      return { type, name };
-                    });
-                  }
-                  
-                  // Parse attachments
-                  if (row.attachments_data) {
-                    notice.attachments = row.attachments_data.split('|').map(attachment => {
-                      const [name, path, size, type] = attachment.split(':');
-                      return { name, path, size: parseInt(size), type };
-                    });
-                  }
-                  
-                  return notice;
-                });
-                
-                res.json(notices);
-              } catch (err) {
-                console.error('Error fetching notices:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // Get unread notice count for a user
-            app.get('/api/notices/unread-count', async (req, res) => {
-              const { user_id, user_role } = req.query;
-              
-              if (!user_id) {
-                return res.status(400).json({ error: 'user_id is required' });
-              }
-              
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                let query;
-                let queryParams;
-                
-                // Check if user is admin (either hardcoded admin or employee with admin role)
-                const isAdmin = (user_role && user_role.toLowerCase() === 'admin') || 
-                               (user_id === 'admin');
-                
-                if (isAdmin) {
-                  // For admin users, count all published notices
-                  if (user_id === 'admin') {
-                    // For hardcoded admin, don't check read status since they're not in notice_read_status table
-                    query = `
-                      SELECT COUNT(DISTINCT n.id) as unread_count
-                      FROM notices n
-                      WHERE n.status = 'published'
-                    `;
-                    queryParams = [];
-                  } else {
-                    // For employee admins, check read status
-                    query = `
-                      SELECT COUNT(DISTINCT n.id) as unread_count
-                      FROM notices n
-                      LEFT JOIN notice_read_status nrs ON n.id = nrs.notice_id AND nrs.user_id = ?
-                      WHERE n.status = 'published'
-                      AND (nrs.is_read IS NULL OR nrs.is_read = FALSE)
-                    `;
-                    queryParams = [user_id];
-                  }
-                } else {
-                  // For non-admin users, count only notices assigned to them
-                  query = `
-                    SELECT COUNT(DISTINCT n.id) as unread_count
-                    FROM notices n
-                    INNER JOIN notice_recipients nr ON n.id = nr.notice_id
-                    LEFT JOIN notice_read_status nrs ON n.id = nrs.notice_id AND nrs.user_id = ?
-                    WHERE n.status = 'published'
-                    AND (
-                      (nr.recipient_type = 'employee' AND nr.recipient_id = ?)
-                      OR (nr.recipient_type = 'department' AND nr.recipient_id IN (
-                        SELECT department FROM employees WHERE id = ?
-                      ))
-                    )
-                    AND (nrs.is_read IS NULL OR nrs.is_read = FALSE)
-                  `;
-                  queryParams = [user_id, user_id, user_id];
-                }
-                
-                const [rows] = await connection.execute(query, queryParams);
-                const unreadCount = rows[0].unread_count || 0;
-                
-                res.json({ unread_count: unreadCount });
-              } catch (err) {
-                console.error('Error fetching unread notice count:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // Get a specific notice
-            app.get('/api/notices/:id', async (req, res) => {
-              const { id } = req.params;
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                const query = `
-                  SELECT 
-                    n.*,
-                    CONCAT('User ', n.created_by) as created_by_name
-                  FROM notices n
-                  WHERE n.id = ?
-                `;
-                
-                const [rows] = await connection.execute(query, [id]);
-                
-                if (rows.length === 0) {
-                  return res.status(404).json({ error: 'Notice not found' });
-                }
-                
-                const notice = rows[0];
-                
-                // Get recipients
-                const recipientsQuery = `
-                  SELECT recipient_type, recipient_id, recipient_name, is_read, read_at
-                  FROM notice_recipients
-                  WHERE notice_id = ?
-                `;
-                const [recipients] = await connection.execute(recipientsQuery, [id]);
-                notice.recipients = recipients;
-                
-                // Get attachments
-                const attachmentsQuery = `
-                  SELECT file_name, file_path, file_size, file_type
-                  FROM notice_attachments
-                  WHERE notice_id = ?
-                `;
-                const [attachments] = await connection.execute(attachmentsQuery, [id]);
-                notice.attachments = attachments;
-                
-                res.json(notice);
-              } catch (err) {
-                console.error('Error fetching notice:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // Create a new notice
-            app.post('/api/notices', async (req, res) => {
-              const { title, description, priority, status, recipients, attachments, created_by } = req.body;
-              
-              if (!title || !description || !recipients || !Array.isArray(recipients)) {
-                return res.status(400).json({ error: 'Title, description, and recipients are required' });
-              }
-              
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                await connection.beginTransaction();
-                
-                // Insert notice
-                const noticeQuery = `
-                  INSERT INTO notices (title, description, priority, status, created_by)
-                  VALUES (?, ?, ?, ?, ?)
-                `;
-                const [noticeResult] = await connection.execute(
-                  noticeQuery, 
-                  [title, description, priority || 'medium', status || 'draft', created_by]
-                );
-                
-                const noticeId = noticeResult.insertId;
-                
-                // Insert recipients
-                for (const recipient of recipients) {
-                  const recipientQuery = `
-                    INSERT INTO notice_recipients (notice_id, recipient_type, recipient_id, recipient_name)
-                    VALUES (?, ?, ?, ?)
-                  `;
-                  await connection.execute(
-                    recipientQuery,
-                    [noticeId, recipient.type, recipient.value, recipient.label]
-                  );
-                }
-                
-                // Insert attachments if any
-                if (attachments && attachments.length > 0) {
-                  for (const attachment of attachments) {
-                    const attachmentQuery = `
-                      INSERT INTO notice_attachments (notice_id, file_name, file_path, file_size, file_type, uploaded_by)
-                      VALUES (?, ?, ?, ?, ?, ?)
-                    `;
-                    await connection.execute(
-                      attachmentQuery,
-                      [noticeId, attachment.name, attachment.path, attachment.size, attachment.type, created_by]
-                    );
-                  }
-                }
-                
-                await connection.commit();
-                
-                res.status(201).json({ 
-                  message: 'Notice created successfully',
-                  notice_id: noticeId
-                });
-              } catch (err) {
-                await connection.rollback();
-                console.error('Error creating notice:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // Update a notice
-            app.put('/api/notices/:id', async (req, res) => {
-              const { id } = req.params;
-              const { title, description, priority, status, recipients, attachments } = req.body;
-              
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                await connection.beginTransaction();
-                
-                // Update notice
-                const noticeQuery = `
-                  UPDATE notices 
-                  SET title = ?, description = ?, priority = ?, status = ?, updated_at = CURRENT_TIMESTAMP
-                  WHERE id = ?
-                `;
-                await connection.execute(
-                  noticeQuery,
-                  [title, description, priority, status, id]
-                );
-                
-                // Delete existing recipients and attachments
-                await connection.execute('DELETE FROM notice_recipients WHERE notice_id = ?', [id]);
-                await connection.execute('DELETE FROM notice_attachments WHERE notice_id = ?', [id]);
-                
-                // Insert new recipients
-                if (recipients && recipients.length > 0) {
-                  for (const recipient of recipients) {
-                    const recipientQuery = `
-                      INSERT INTO notice_recipients (notice_id, recipient_type, recipient_id, recipient_name)
-                      VALUES (?, ?, ?, ?)
-                    `;
-                    await connection.execute(
-                      recipientQuery,
-                      [id, recipient.type, recipient.value, recipient.label]
-                    );
-                  }
-                }
-                
-                // Insert new attachments
-                if (attachments && attachments.length > 0) {
-                  for (const attachment of attachments) {
-                    const attachmentQuery = `
-                      INSERT INTO notice_attachments (notice_id, file_name, file_path, file_size, file_type, uploaded_by)
-                      VALUES (?, ?, ?, ?, ?, ?)
-                    `;
-                    await connection.execute(
-                      attachmentQuery,
-                      [id, attachment.name, attachment.path, attachment.size, attachment.type, attachment.uploaded_by]
-                    );
-                  }
-                }
-                
-                await connection.commit();
-                
-                res.json({ message: 'Notice updated successfully' });
-              } catch (err) {
-                await connection.rollback();
-                console.error('Error updating notice:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // Delete a notice
-            app.delete('/api/notices/:id', async (req, res) => {
-              const { id } = req.params;
-              
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                const [result] = await connection.execute('DELETE FROM notices WHERE id = ?', [id]);
-                
-                if (result.affectedRows === 0) {
-                  return res.status(404).json({ error: 'Notice not found' });
-                }
-                
-                res.json({ message: 'Notice deleted successfully' });
-              } catch (err) {
-                console.error('Error deleting notice:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // Mark notice as read
-            app.post('/api/notices/:id/mark-read', async (req, res) => {
-              const { id } = req.params;
-              const { userId } = req.body;
-              
-              if (!userId) {
-                return res.status(400).json({ error: 'userId is required' });
-              }
-              
-              let connection;
-              try {
-                connection = await mysqlPool.getConnection();
-                await connection.ping();
-                
-                // Check if read status already exists
-                const checkQuery = `
-                  SELECT id FROM notice_read_status 
-                  WHERE notice_id = ? AND user_id = ?
-                `;
-                const [existing] = await connection.execute(checkQuery, [id, userId]);
-                
-                if (existing.length > 0) {
-                  // Update existing record
-                  const updateQuery = `
-                    UPDATE notice_read_status 
-                    SET is_read = TRUE, read_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
-                    WHERE notice_id = ? AND user_id = ?
-                  `;
-                  await connection.execute(updateQuery, [id, userId]);
-                } else {
-                  // Insert new record
-                  const insertQuery = `
-                    INSERT INTO notice_read_status (notice_id, user_id, is_read, read_at)
-                    VALUES (?, ?, TRUE, CURRENT_TIMESTAMP)
-                  `;
-                  await connection.execute(insertQuery, [id, userId]);
-                }
-                
-                res.json({ message: 'Notice marked as read' });
-              } catch (err) {
-                console.error('Error marking notice as read:', err);
-                res.status(500).json({ error: 'Database error' });
-              } finally {
-                if (connection) {
-                  connection.release();
-                }
-              }
-            });
-
-            // File upload for notice attachments
-            app.post('/api/notices/upload', async (req, res) => {
-              const upload = multer({
-                storage: multer.diskStorage({
-                  destination: (req, file, cb) => {
-                    const uploadDir = path.join(__dirname, 'uploads', 'notice-attachments');
-                    if (!fs.existsSync(uploadDir)) {
-                      fs.mkdirSync(uploadDir, { recursive: true });
-                    }
-                    cb(null, uploadDir);
-                  },
-                  filename: (req, file, cb) => {
-                    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-                    cb(null, uniqueSuffix + '-' + file.originalname);
-                  }
-                }),
-                limits: {
-                  fileSize: 10 * 1024 * 1024 // 10MB limit
-                },
-                fileFilter: (req, file, cb) => {
-                  // Allow common file types
-                  const allowedTypes = /jpeg|jpg|png|gif|pdf|doc|docx|xls|xlsx|txt|zip|rar/;
-                  const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-                  const mimetype = allowedTypes.test(file.mimetype);
-                  
-                  if (mimetype && extname) {
-                    return cb(null, true);
-                  } else {
-                    cb(new Error('Invalid file type'));
-                  }
-                }
-              });
-              
-              upload.array('attachments', 10)(req, res, (err) => {
-                if (err) {
-                  console.error('File upload error:', err);
-                  return res.status(400).json({ error: err.message });
-                }
-                
-                if (!req.files || req.files.length === 0) {
-                  return res.status(400).json({ error: 'No files uploaded' });
-                }
-                
-                const files = req.files.map(file => ({
-                  name: file.originalname,
-                  path: file.path,
-                  size: file.size,
-                  type: file.mimetype
-                }));
-                
-                res.json({ files });
-              });
-            });
-
-            // Test endpoint to verify server is working
-            app.get('/api/test', (req, res) => {
-              res.json({ message: 'Server is working!', timestamp: new Date().toISOString() });
-            });
-
-// Helper function to get health settings
-async function getHealthSettings(connection) {
-  try {
-    const [settings] = await connection.execute('SELECT * FROM health_settings');
-    const settingsObj = {};
-    settings.forEach(setting => {
-      let value = setting.setting_value;
-      if (setting.setting_type === 'number') {
-        value = parseFloat(value);
-      } else if (setting.setting_type === 'boolean') {
-        value = value === 'true';
-      }
-      settingsObj[setting.setting_key] = value;
-    });
-    return settingsObj;
-  } catch (err) {
-    console.error('Error fetching health settings:', err);
-    // Return default settings if database error
-    return {
-      top_rated_threshold: 300,
-      average_threshold: 200,
-      below_standard_threshold: 199,
-      task_points_per_day: 2,
-      task_cycle_months: 3,
-      task_cycle_offset_days: 2,
-      hours_points_per_month: 8,
-      expected_hours_per_day: 8,
-      working_days_per_week: 6,
-      hr_cycle_months: 3,
-      error_high_deduction: 15,
-      error_medium_deduction: 8,
-      error_low_deduction: 3,
-      appreciation_bonus: 5,
-      attendance_deduction: 5,
-      max_absences_per_month: 2,
-      data_cycle_months: 3,
-      warning_letters_deduction: 10,
-      warning_letters_cycle_months: 6,
-      warning_letters_cycle_offset_days: 0,
-      warning_letters_severity_high_deduction: 20,
-      warning_letters_severity_medium_deduction: 15,
-      warning_letters_severity_low_deduction: 10
-    };
-  }
-}
-
-// Health Settings API Routes
-
-// Get all health settings
-app.get('/api/health-settings', async (req, res) => {
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const [settings] = await connection.execute('SELECT * FROM health_settings ORDER BY setting_key');
-    
-    // Convert array to object for easier frontend usage
-    const settingsObj = {};
-    settings.forEach(setting => {
-      let value = setting.setting_value;
-      if (setting.setting_type === 'number') {
-        value = parseFloat(value);
-      } else if (setting.setting_type === 'boolean') {
-        value = value === 'true';
-      }
-      settingsObj[setting.setting_key] = {
-        value: value,
-        type: setting.setting_type,
-        description: setting.description
-      };
-    });
-    
-    res.json(settingsObj);
-  } catch (err) {
-    console.error('Error fetching health settings:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Update health settings
-app.put('/api/health-settings', async (req, res) => {
-  const settings = req.body;
-  let connection;
-  
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    // Validate settings
-    const validSettings = [
-      'top_rated_threshold', 'average_threshold', 'below_standard_threshold',
-      'task_points_per_day', 'task_cycle_months', 'task_cycle_offset_days',
-      'hours_points_per_month', 'expected_hours_per_day', 'working_days_per_week', 'hr_cycle_months',
-      'error_high_deduction', 'error_medium_deduction', 'error_low_deduction',
-      'appreciation_bonus', 'attendance_deduction', 'max_absences_per_month', 'data_cycle_months',
-      'warning_letters_deduction', 'warning_letters_cycle_months', 'warning_letters_cycle_offset_days',
-      'warning_letters_severity_high_deduction', 'warning_letters_severity_medium_deduction', 'warning_letters_severity_low_deduction'
-    ];
-    
-    // Update each setting
-    for (const [key, value] of Object.entries(settings)) {
-      if (validSettings.includes(key)) {
-        await connection.execute(
-          'UPDATE health_settings SET setting_value = ?, updated_at = CURRENT_TIMESTAMP WHERE setting_key = ?',
-          [value.toString(), key]
-        );
-      }
-    }
-    
-    res.json({ message: 'Health settings updated successfully' });
-  } catch (err) {
-    console.error('Error updating health settings:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Reset health settings to defaults
-app.post('/api/health-settings/reset', async (req, res) => {
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    // Reset to default values
-    const defaultSettings = {
-      'top_rated_threshold': '300',
-      'average_threshold': '200',
-      'below_standard_threshold': '199',
-      'task_points_per_day': '2',
-      'task_cycle_months': '3',
-      'task_cycle_offset_days': '2',
-      'hours_points_per_month': '8',
-      'expected_hours_per_day': '8',
-      'working_days_per_week': '6',
-      'hr_cycle_months': '3',
-      'error_high_deduction': '15',
-      'error_medium_deduction': '8',
-      'error_low_deduction': '3',
-      'appreciation_bonus': '5',
-      'attendance_deduction': '5',
-      'max_absences_per_month': '2',
-      'data_cycle_months': '3',
-      'warning_letters_deduction': '10',
-      'warning_letters_cycle_months': '6',
-      'warning_letters_cycle_offset_days': '0',
-      'warning_letters_severity_high_deduction': '20',
-      'warning_letters_severity_medium_deduction': '15',
-      'warning_letters_severity_low_deduction': '10'
-    };
-    
-    for (const [key, value] of Object.entries(defaultSettings)) {
-      await connection.execute(
-        'UPDATE health_settings SET setting_value = ?, updated_at = CURRENT_TIMESTAMP WHERE setting_key = ?',
-        [value, key]
-      );
-    }
-    
-    res.json({ message: 'Health settings reset to defaults' });
-  } catch (err) {
-    console.error('Error resetting health settings:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Warning Letters API Routes
-
-// Warning Letter Types APIs
-app.get('/api/warning-letter-types', async (req, res) => {
-  const query = 'SELECT id, name, status, created_at FROM warning_letter_types WHERE status = "Active" ORDER BY name ASC';
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const [rows] = await connection.execute(query);
-    res.json(rows);
-  } catch (err) {
-    console.error('Error fetching warning letter types:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-app.post('/api/warning-letter-types', async (req, res) => {
-  const { name } = req.body;
-  if (!name || !String(name).trim()) {
-    return res.status(400).json({ error: 'name is required' });
-  }
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const insert = 'INSERT INTO warning_letter_types (name) VALUES (?)';
-    const [result] = await connection.execute(insert, [String(name).trim()]);
-    
-    // Get the created warning letter type
-    const [rows] = await connection.execute('SELECT id, name, status, created_at FROM warning_letter_types WHERE id = ?', [result.insertId]);
-    
-    if (rows.length > 0) {
-      res.status(201).json(rows[0]);
-    } else {
-      res.status(201).json({ id: result.insertId, message: 'Saved' });
-    }
-  } catch (err) {
-    if (err.code === 'ER_DUP_ENTRY') {
-        return res.status(400).json({ error: 'This warning letter type already exists' });
-      }
-      console.error('Error creating warning letter type:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Get all warning letters
-app.get('/api/warning-letters', async (req, res) => {
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      SELECT wl.id, wl.employee_id, wl.employee_name, wl.title, wl.description, wl.warning_date, wl.severity, wl.created_at
-      FROM warning_letters wl 
-      ORDER BY wl.created_at DESC
-    `;
-    
-    const [warningLetters] = await connection.execute(query);
-    res.json(warningLetters);
-  } catch (err) {
-    console.error('Error fetching warning letters:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
 // Delete multiple warning letters (bulk delete)
 app.delete('/api/warning-letters/bulk', async (req, res) => {
   const { ids } = req.body;
