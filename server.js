@@ -6287,7 +6287,6 @@ app.put('/api/roles/:id', async (req, res) => {
     }
   }
 });
-
 app.delete('/api/roles/:id', async (req, res) => {
   let connection;
   try {
@@ -6920,9 +6919,7 @@ app.delete('/api/warning-letters/:id', async (req, res) => {
     }
   }
 });
-
 // Tickets API Routes
-
 // Get all tickets
 app.get('/api/tickets', async (req, res) => {
   let connection;
@@ -7565,9 +7562,7 @@ const createNotification = async (userId, ticketId, type, title, message) => {
     }
   }
 };
-
 // Ticket Notifications API Routes
-
 // Get notifications for a user
 app.get('/api/notifications', async (req, res) => {
   const { user_id } = req.query;
@@ -8198,7 +8193,6 @@ app.get('/api/notifications/less-trained-employees', async (req, res) => {
     }
   }
 });
-
 // Authentication endpoint
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
@@ -8466,6 +8460,194 @@ app.put('/api/tickets/:id/mark-unread', async (req, res) => {
     res.json({ message: 'Ticket marked as unread for specified users' });
   } catch (err) {
     console.error('Error marking ticket as unread:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+// Helper function to get health settings
+async function getHealthSettings(connection) {
+  try {
+    const [settings] = await connection.execute('SELECT * FROM health_settings');
+    const settingsObj = {};
+    settings.forEach(setting => {
+      let value = setting.setting_value;
+      if (setting.setting_type === 'number') {
+        value = parseFloat(value);
+      } else if (setting.setting_type === 'boolean') {
+        value = value === 'true';
+      }
+      settingsObj[setting.setting_key] = value;
+    });
+    return settingsObj;
+  } catch (err) {
+    console.error('Error fetching health settings:', err);
+    return {
+      top_rated_threshold: 300,
+      average_threshold: 200,
+      below_standard_threshold: 199,
+      task_points_per_day: 2,
+      task_cycle_months: 3,
+      task_cycle_offset_days: 2,
+      hours_points_per_month: 8,
+      expected_hours_per_day: 8,
+      working_days_per_week: 6,
+      hr_cycle_months: 3,
+      error_high_deduction: 15,
+      error_medium_deduction: 8,
+      error_low_deduction: 3,
+      appreciation_bonus: 5,
+      attendance_deduction: 5,
+      max_absences_per_month: 2,
+      data_cycle_months: 3,
+      warning_letters_deduction: 10,
+      warning_letters_cycle_months: 6,
+      warning_letters_cycle_offset_days: 0,
+      warning_letters_severity_high_deduction: 20,
+      warning_letters_severity_medium_deduction: 15,
+      warning_letters_severity_low_deduction: 10
+    };
+  }
+}
+
+// Health Settings API Routes
+app.get('/api/health-settings', async (req, res) => {
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const [settings] = await connection.execute('SELECT * FROM health_settings ORDER BY setting_key');
+
+    const settingsObj = {};
+    settings.forEach(setting => {
+      let value = setting.setting_value;
+      if (setting.setting_type === 'number') {
+        value = parseFloat(value);
+      } else if (setting.setting_type === 'boolean') {
+        value = value === 'true';
+      }
+      settingsObj[setting.setting_key] = {
+        value,
+        type: setting.setting_type,
+        description: setting.description
+      };
+    });
+
+    res.json(settingsObj);
+  } catch (err) {
+    console.error('Error fetching health settings:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.put('/api/health-settings', async (req, res) => {
+  const settings = req.body;
+  let connection;
+
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const validSettings = [
+      'top_rated_threshold', 'average_threshold', 'below_standard_threshold',
+      'task_points_per_day', 'task_cycle_months', 'task_cycle_offset_days',
+      'hours_points_per_month', 'expected_hours_per_day', 'working_days_per_week', 'hr_cycle_months',
+      'error_high_deduction', 'error_medium_deduction', 'error_low_deduction',
+      'appreciation_bonus', 'attendance_deduction', 'max_absences_per_month', 'data_cycle_months',
+      'warning_letters_deduction', 'warning_letters_cycle_months', 'warning_letters_cycle_offset_days',
+      'warning_letters_severity_high_deduction', 'warning_letters_severity_medium_deduction', 'warning_letters_severity_low_deduction'
+    ];
+
+    const updateQuery = 'INSERT INTO health_settings (setting_key, setting_value, setting_type, description) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), setting_type = VALUES(setting_type), description = VALUES(description)';
+
+    for (const key of Object.keys(settings)) {
+      if (!validSettings.includes(key)) {
+        continue;
+      }
+
+      const setting = settings[key];
+      let value = setting.value;
+      if (setting.type === 'number') {
+        value = setting.value.toString();
+      } else if (setting.type === 'boolean') {
+        value = setting.value ? 'true' : 'false';
+      } else if (setting.type === 'json') {
+        value = JSON.stringify(setting.value);
+      }
+
+      await connection.execute(updateQuery, [
+        key,
+        value,
+        setting.type || 'string',
+        setting.description || ''
+      ]);
+    }
+
+    res.json({ message: 'Health settings updated successfully' });
+  } catch (err) {
+    console.error('Error updating health settings:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/health-settings/defaults', async (req, res) => {
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const defaults = {
+      top_rated_threshold: { value: 300, type: 'number', description: 'Score required to be considered top rated' },
+      average_threshold: { value: 200, type: 'number', description: 'Score required to be considered average' },
+      below_standard_threshold: { value: 199, type: 'number', description: 'Below this score is considered below standard' },
+      task_points_per_day: { value: 2, type: 'number', description: 'Points awarded per task completed per day' },
+      task_cycle_months: { value: 3, type: 'number', description: 'Number of months for task evaluation cycle' },
+      task_cycle_offset_days: { value: 2, type: 'number', description: 'Offset days for task cycle' },
+      hours_points_per_month: { value: 8, type: 'number', description: 'Points awarded per hour worked per month' },
+      expected_hours_per_day: { value: 8, type: 'number', description: 'Expected working hours per day' },
+      working_days_per_week: { value: 6, type: 'number', description: 'Number of working days per week' },
+      hr_cycle_months: { value: 3, type: 'number', description: 'HR cycle length in months' },
+      error_high_deduction: { value: 15, type: 'number', description: 'Points deducted for high severity errors' },
+      error_medium_deduction: { value: 8, type: 'number', description: 'Points deducted for medium severity errors' },
+      error_low_deduction: { value: 3, type: 'number', description: 'Points deducted for low severity errors' },
+      appreciation_bonus: { value: 5, type: 'number', description: 'Points awarded for appreciations' },
+      attendance_deduction: { value: 5, type: 'number', description: 'Points deducted for attendance issues' },
+      max_absences_per_month: { value: 2, type: 'number', description: 'Maximum allowed absences per month' },
+      data_cycle_months: { value: 3, type: 'number', description: 'Number of months for data evaluation cycle' },
+      warning_letters_deduction: { value: 10, type: 'number', description: 'Points deducted for warning letters' },
+      warning_letters_cycle_months: { value: 6, type: 'number', description: 'Number of months for warning letter evaluation' },
+      warning_letters_cycle_offset_days: { value: 0, type: 'number', description: 'Offset days for warning letter cycle' },
+      warning_letters_severity_high_deduction: { value: 20, type: 'number', description: 'Points deducted for high severity warning letters' },
+      warning_letters_severity_medium_deduction: { value: 15, type: 'number', description: 'Points deducted for medium severity warning letters' },
+      warning_letters_severity_low_deduction: { value: 10, type: 'number', description: 'Points deducted for low severity warning letters' }
+    };
+
+    const insertQuery = 'INSERT INTO health_settings (setting_key, setting_value, setting_type, description) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value), setting_type = VALUES(setting_type), description = VALUES(description)';
+
+    for (const [key, setting] of Object.entries(defaults)) {
+      await connection.execute(insertQuery, [
+        key,
+        setting.value.toString(),
+        setting.type,
+        setting.description
+      ]);
+    }
+
+    res.json({ message: 'Health settings reset to defaults successfully' });
+  } catch (err) {
+    console.error('Error resetting health settings to defaults:', err);
     res.status(500).json({ error: 'Database error' });
   } finally {
     if (connection) {
