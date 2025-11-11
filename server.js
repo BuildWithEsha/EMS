@@ -608,7 +608,6 @@ app.get('/api/attendance/status', async (req, res) => {
     }
   }
 });
-
 // Clock in
 app.post('/api/attendance/clock-in', async (req, res) => {
   const { employee_id, when } = req.body;
@@ -1218,7 +1217,6 @@ app.get('/api/attendance/test-clear-all', (req, res) => {
     requiredHeader: 'x-confirm-clear-all: true'
   });
 });
-
 // Import attendance records from Excel file
 app.post('/api/attendance/import', upload.single('file'), async (req, res) => {
   if (!req.file) {
@@ -1841,7 +1839,6 @@ app.delete('/api/appreciations/:id', async (req, res) => {
     }
   }
 });
-
 // Delete multiple appreciations (bulk delete)
 app.delete('/api/appreciations/bulk', async (req, res) => {
   const { ids } = req.body;
@@ -2850,7 +2847,6 @@ app.get('/api/employees/:id/health', async (req, res) => {
           resolve();
         }
       }),
-      
       // 6. Calculate warning letters deductions
       new Promise(async (resolve) => {
         // Calculate warning letters cycle using dynamic settings
@@ -4004,7 +4000,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
                 }
               }
             });
-
             // Import labels from Excel file
             app.post('/api/labels/import', upload.single('file'), async (req, res) => {
               if (!req.file) {
@@ -4405,7 +4400,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
     query += ` LIMIT ${safeLimit} OFFSET ${safeOffset}`;
     // Don't push limitNum and offset to params array
   }
-  
   // Debug logging - show final query and params
   console.log('🔍 Backend Debug - Final Query:', query);
   console.log('🔍 Backend Debug - Query Params:', params);
@@ -5008,7 +5002,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
                 }
               }
             });
-
             // Start timer for task
             app.post('/api/tasks/:id/start-timer', async (req, res) => {
               const taskId = req.params.id;
@@ -5624,7 +5617,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
                 }
               }
             });
-
             // Download task attachment
             app.get('/api/tasks/:id/attachments/:attachmentId/download', async (req, res) => {
               const { id: taskId, attachmentId } = req.params;
@@ -6249,7 +6241,6 @@ app.post('/api/roles', async (req, res) => {
     }
   }
 });
-
 app.put('/api/roles/:id', async (req, res) => {
   let connection;
   try {
@@ -6870,7 +6861,6 @@ app.post('/api/warning-letters', async (req, res) => {
     }
   }
 });
-
 // Update warning letter
 app.put('/api/warning-letters/:id', async (req, res) => {
   const warningLetterId = req.params.id;
@@ -7469,7 +7459,6 @@ app.post('/api/tickets/:id/replies', upload.any(), async (req, res) => {
     }
   }
 });
-
 // Update a reply
 app.put('/api/tickets/:ticketId/replies/:replyId', async (req, res) => {
   const { ticketId, replyId } = req.params;
@@ -8099,7 +8088,6 @@ app.get('/api/notifications/missed-tasks', async (req, res) => {
     }
   }
 });
-
 // Less Trained Employees (LTE) Notifications API
 app.get('/api/notifications/less-trained-employees', async (req, res) => {
   // Check if user has lte_view permission
