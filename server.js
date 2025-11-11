@@ -657,34 +657,54 @@ app.post('/api/attendance/clock-out', async (req, res) => {
     
     const row = rows[0];
     
-    // Parse clock_in time properly - handle timezone consistently
-    let clockInTime;
-    if (row.clock_in.includes('T') || row.clock_in.includes(' ')) {
-      // Full datetime format - parse as local time
-      clockInTime = new Date(row.clock_in);
-    } else {
-      // Time only format - combine with today's date in local timezone
-      clockInTime = new Date(`${today}T${row.clock_in}`);
-    }
-    
-    const currentSessionDuration = Math.max(0, Math.floor((new Date(now) - clockInTime) / 1000));
+    const normalizeToDate = (value) => {
+      if (!value) {
+        return null;
+      }
+
+      if (value instanceof Date) {
+        return value;
+      }
+
+      const strValue = String(value).trim();
+      if (!strValue) {
+        return null;
+      }
+
+      if (strValue.includes('T')) {
+        return new Date(strValue.replace(' ', 'T'));
+      }
+
+      if (strValue.includes(' ')) {
+        const [datePart, timePart] = strValue.split(' ');
+        return new Date(`${datePart}T${timePart}`);
+      }
+
+      return new Date(`${today}T${strValue}`);
+    };
+
+    const clockInTime = normalizeToDate(row.clock_in);
+    const nowDate = normalizeToDate(now);
+    const nowForDb = now.replace('T', ' ');
+
+    const currentSessionDuration = Math.max(0, Math.floor(((nowDate || new Date()) - (clockInTime || new Date())) / 1000));
     
     // Calculate total duration (previous sessions + current session)
     const previousDuration = row.duration_seconds || 0;
     const totalDurationSeconds = previousDuration + currentSessionDuration;
-    const totalHoursWorked = totalDurationSeconds / 3600;
+    const totalHoursWorked = Number((totalDurationSeconds / 3600).toFixed(4));
     
     // Update the record with clock-out time and total duration
     await connection.execute(
       'UPDATE attendance SET clock_out = ?, duration_seconds = ?, hours_worked = ? WHERE id = ?', 
-      [now, totalDurationSeconds, totalHoursWorked, row.id]
+      [nowForDb, totalDurationSeconds, totalHoursWorked, row.id]
     );
     
     res.json({ 
       id: row.id, 
       employee_id, 
-      clock_in: row.clock_in, 
-      clock_out: now, 
+      clock_in: clockInTime ? clockInTime.toISOString() : row.clock_in, 
+      clock_out: nowDate ? nowDate.toISOString() : `${nowForDb.replace(' ', 'T')}`, 
       duration_seconds: totalDurationSeconds,
       hours_worked: totalHoursWorked,
       session_count: row.session_count || 1
@@ -729,7 +749,6 @@ app.get('/api/attendance/summary', async (req, res) => {
     }
   }
 });
-
 // Add manual attendance record
 app.post('/api/attendance/add', async (req, res) => {
   const { employee_id, date, clock_in, clock_out, hours_worked } = req.body;
@@ -789,7 +808,6 @@ app.post('/api/attendance/add', async (req, res) => {
     }
   }
 });
-
 // Update attendance record
 app.put('/api/attendance/:id', async (req, res) => {
   const { id } = req.params;
@@ -1497,7 +1515,6 @@ app.get('/api/reports/timelog/consolidated', async (req, res) => {
     }
   }
 });
-
 // Day summary across employees
 app.get('/api/attendance/day-summary', async (req, res) => {
   const { date } = req.query; // YYYY-MM-DD
@@ -1564,7 +1581,6 @@ app.get('/api/errors', async (req, res) => {
     }
   }
 });
-
 app.post('/api/errors', async (req, res) => {
   const { employee_id, task_id, severity, description, error_date } = req.body;
   if (!employee_id || !task_id || !severity) {
@@ -2191,7 +2207,6 @@ app.get('/api/employees/debug', async (req, res) => {
     }
   }
 });
-
 // Get employee health score
 app.get('/api/employees/:id/health', async (req, res) => {
   const employeeId = req.params.id;
@@ -2956,7 +2971,6 @@ app.get('/api/employees/:id', async (req, res) => {
     }
   }
 });
-
 // Create new employee
 app.post('/api/employees', async (req, res) => {
   const employeeData = req.body;
@@ -3347,7 +3361,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
     res.status(500).json({ error: 'Error processing file' });
   }
 });
-
 // ===== DEPARTMENTS API ENDPOINTS =====
 
             // Get all departments
@@ -4110,7 +4123,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
                 }
               }
             });
-
             // Update task configuration
             app.post('/api/task-config', async (req, res) => {
               console.log('🔥 POST /api/task-config called!');
@@ -4887,7 +4899,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
                 }
               }
             });
-
             // Delete all history for a specific task (admin only)
             app.post('/api/task-history/task/:taskId/delete-all', async (req, res) => {
               console.log('POST /api/task-history/task/:taskId/delete-all called');
@@ -5596,10 +5607,6 @@ app.post('/api/employees/import', upload.single('file'), async (req, res) => {
                 }
               }
             });
-
-
-
-
 // Import tasks from Excel file
 app.post('/api/tasks/import', upload.single('file'), async (req, res) => {
   console.log('=== TASK IMPORT REQUEST RECEIVED ===');
@@ -6333,11 +6340,7 @@ app.get('/api/tasks/:id/timesheet', async (req, res) => {
     }
   }
 });
-
 // DWM report aggregated completions per day - Using MySQL version above
-
-
-
 // DWM report details: list tasks and time for a given day/category and completion state
 app.get('/api/reports/dwm/details', async (req, res) => {
   const { date, category, department, employee, completed } = req.query;
@@ -7501,7 +7504,6 @@ app.get('/api/warning-letters', async (req, res) => {
     }
   }
 });
-
 // Delete multiple warning letters (bulk delete)
 app.delete('/api/warning-letters/bulk', async (req, res) => {
   const { ids } = req.body;
@@ -8297,7 +8299,6 @@ app.delete('/api/tickets/:ticketId/replies/:replyId', async (req, res) => {
     }
   }
 });
-
 // Helper function to create notifications
 const createNotification = async (userId, ticketId, type, title, message) => {
   let connection;
@@ -9078,7 +9079,6 @@ app.post('/api/auth/login', async (req, res) => {
     }
   }
 });
-
 // Change password endpoint
 app.post('/api/auth/change-password', async (req, res) => {
   const { email, currentPassword, newPassword } = req.body;
