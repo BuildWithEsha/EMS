@@ -317,6 +317,571 @@ console.log('Default permissions and roles are already configured in MySQL');
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
+// Helper function to get permissions from headers
+const getPermissionsFromHeaders = (req) => {
+  const userPermissions = req.headers['x-user-permissions'];
+  try {
+    return JSON.parse(userPermissions);
+  } catch (error) {
+    console.error('Error parsing user permissions:', error);
+    return [];
+  }
+};
+
+// Helper function to create ticket notifications
+const createNotification = async (userId, ticketId, type, title, message) => {
+  let connection;
+  try {
+    console.log('Creating notification:', { userId, ticketId, type, title, message });
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      INSERT INTO ticket_notifications (user_id, ticket_id, notification_type, title, message)
+      VALUES (?, ?, ?, ?, ?)
+    `;
+
+    const [result] = await connection.execute(query, [userId, ticketId, type, title, message]);
+    console.log('Notification inserted with ID:', result.insertId);
+  } catch (err) {
+    console.error('Error creating notification:', err);
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+};
+
+// Notice Board API Routes
+app.get('/api/notices', async (req, res) => {
+  const { user_id, user_role } = req.query;
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    let whereClause = '';
+    let queryParams = [];
+
+    const isAdmin =
+      (user_role && user_role.toLowerCase() === 'admin') ||
+      user_id === 'admin' ||
+      !user_id;
+
+    if (user_id && !isAdmin) {
+      whereClause = `
+        WHERE n.id IN (
+          SELECT DISTINCT notice_id
+          FROM notice_recipients
+          WHERE (recipient_type = 'employee' AND recipient_id = ?)
+             OR (recipient_type = 'department' AND recipient_id IN (
+                  SELECT department FROM employees WHERE id = ?
+                ))
+        )
+      `;
+      queryParams = [user_id, user_id];
+    }
+
+    let query;
+    if (user_id === 'admin') {
+      query = `
+        SELECT
+          n.*,
+          CONCAT('User ', n.created_by) as created_by_name,
+          GROUP_CONCAT(
+            CONCAT(nr.recipient_type, ':', nr.recipient_name)
+            SEPARATOR '|'
+          ) as recipients_data,
+          GROUP_CONCAT(
+            CONCAT(na.file_name, ':', na.file_path, ':', na.file_size, ':', na.file_type)
+            SEPARATOR '|'
+          ) as attachments_data,
+          FALSE as user_read_status,
+          NULL as user_read_at
+        FROM notices n
+        LEFT JOIN notice_recipients nr ON n.id = nr.notice_id
+        LEFT JOIN notice_attachments na ON n.id = na.notice_id
+        ${whereClause}
+        GROUP BY n.id
+        ORDER BY n.created_at DESC
+      `;
+    } else {
+      query = `
+        SELECT
+          n.*,
+          CONCAT('User ', n.created_by) as created_by_name,
+          GROUP_CONCAT(
+            CONCAT(nr.recipient_type, ':', nr.recipient_name)
+            SEPARATOR '|'
+          ) as recipients_data,
+          GROUP_CONCAT(
+            CONCAT(na.file_name, ':', na.file_path, ':', na.file_size, ':', na.file_type)
+            SEPARATOR '|'
+          ) as attachments_data,
+          nrs.is_read as user_read_status,
+          nrs.read_at as user_read_at
+        FROM notices n
+        LEFT JOIN notice_recipients nr ON n.id = nr.notice_id
+        LEFT JOIN notice_attachments na ON n.id = na.notice_id
+        LEFT JOIN notice_read_status nrs ON n.id = nrs.notice_id AND nrs.user_id = ?
+        ${whereClause}
+        GROUP BY n.id
+        ORDER BY n.created_at DESC
+      `;
+      queryParams.unshift(user_id || null);
+    }
+
+    const [rows] = await connection.execute(query, queryParams);
+
+    const notices = rows.map(row => {
+      const notice = {
+        id: row.id,
+        title: row.title,
+        description: row.description,
+        priority: row.priority,
+        status: row.status,
+        created_by: row.created_by,
+        created_by_name: row.created_by_name,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        expiry_date: row.expiry_date,
+        is_read: row.user_read_status || false,
+        read_at: row.user_read_at,
+        recipients: [],
+        attachments: []
+      };
+
+      if (row.recipients_data) {
+        notice.recipients = row.recipients_data.split('|').map(recipient => {
+          const [type, name] = recipient.split(':');
+          return { type, name };
+        });
+      }
+
+      if (row.attachments_data) {
+        notice.attachments = row.attachments_data.split('|').map(attachment => {
+          const [name, path, size, type] = attachment.split(':');
+          return { name, path, size: parseInt(size, 10), type };
+        });
+      }
+
+      return notice;
+    });
+
+    res.json(notices);
+  } catch (err) {
+    console.error('Error fetching notices:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/notices/unread-count', async (req, res) => {
+  const { user_id, user_role } = req.query;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    let query;
+    let queryParams;
+
+    const isAdmin =
+      (user_role && user_role.toLowerCase() === 'admin') ||
+      user_id === 'admin';
+
+    if (isAdmin) {
+      if (user_id === 'admin') {
+        query = `
+          SELECT COUNT(DISTINCT n.id) as unread_count
+          FROM notices n
+          WHERE n.status = 'published'
+        `;
+        queryParams = [];
+      } else {
+        query = `
+          SELECT COUNT(DISTINCT n.id) as unread_count
+          FROM notices n
+          LEFT JOIN notice_read_status nrs ON n.id = nrs.notice_id AND nrs.user_id = ?
+          WHERE n.status = 'published'
+            AND (nrs.is_read IS NULL OR nrs.is_read = FALSE)
+        `;
+        queryParams = [user_id];
+      }
+    } else {
+      query = `
+        SELECT COUNT(DISTINCT n.id) as unread_count
+        FROM notices n
+        INNER JOIN notice_recipients nr ON n.id = nr.notice_id
+        LEFT JOIN notice_read_status nrs ON n.id = nrs.notice_id AND nrs.user_id = ?
+        WHERE n.status = 'published'
+          AND (
+            (nr.recipient_type = 'employee' AND nr.recipient_id = ?)
+            OR (nr.recipient_type = 'department' AND nr.recipient_id IN (
+                  SELECT department FROM employees WHERE id = ?
+                ))
+          )
+          AND (nrs.is_read IS NULL OR nrs.is_read = FALSE)
+      `;
+      queryParams = [user_id, user_id, user_id];
+    }
+
+    const [rows] = await connection.execute(query, queryParams);
+    const unreadCount = rows[0].unread_count || 0;
+
+    res.json({ unread_count: unreadCount });
+  } catch (err) {
+    console.error('Error fetching unread notice count:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/notices/:id', async (req, res) => {
+  const { id } = req.params;
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      SELECT
+        n.*,
+        CONCAT('User ', n.created_by) as created_by_name
+      FROM notices n
+      WHERE n.id = ?
+    `;
+
+    const [rows] = await connection.execute(query, [id]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: 'Notice not found' });
+    }
+
+    const notice = rows[0];
+
+    const recipientsQuery = `
+      SELECT recipient_type, recipient_id, recipient_name, is_read, read_at
+      FROM notice_recipients
+      WHERE notice_id = ?
+    `;
+    const [recipients] = await connection.execute(recipientsQuery, [id]);
+    notice.recipients = recipients;
+
+    const attachmentsQuery = `
+      SELECT file_name, file_path, file_size, file_type
+      FROM notice_attachments
+      WHERE notice_id = ?
+    `;
+    const [attachments] = await connection.execute(attachmentsQuery, [id]);
+    notice.attachments = attachments;
+
+    res.json(notice);
+  } catch (err) {
+    console.error('Error fetching notice:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/notices', async (req, res) => {
+  const { title, description, priority, status, recipients, attachments, created_by } = req.body;
+
+  if (!title || !description || !recipients || !Array.isArray(recipients)) {
+    return res.status(400).json({ error: 'Title, description, and recipients are required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    await connection.beginTransaction();
+
+    const noticeQuery = `
+      INSERT INTO notices (title, description, priority, status, created_by)
+      VALUES (?, ?, ?, ?, ?)
+    `;
+    const [noticeResult] = await connection.execute(
+      noticeQuery,
+      [title, description, priority || 'medium', status || 'draft', created_by]
+    );
+
+    const noticeId = noticeResult.insertId;
+
+    for (const recipient of recipients) {
+      const recipientQuery = `
+        INSERT INTO notice_recipients (notice_id, recipient_type, recipient_id, recipient_name)
+        VALUES (?, ?, ?, ?)
+      `;
+      await connection.execute(
+        recipientQuery,
+        [noticeId, recipient.type, recipient.value, recipient.label]
+      );
+    }
+
+    if (attachments && attachments.length > 0) {
+      for (const attachment of attachments) {
+        const attachmentQuery = `
+          INSERT INTO notice_attachments (notice_id, file_name, file_path, file_size, file_type, uploaded_by)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `;
+        await connection.execute(
+          attachmentQuery,
+          [noticeId, attachment.name, attachment.path, attachment.size, attachment.type, created_by]
+        );
+      }
+    }
+
+    await connection.commit();
+
+    res.status(201).json({
+      message: 'Notice created successfully',
+      notice_id: noticeId
+    });
+  } catch (err) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.error('Error creating notice:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.put('/api/notices/:id', async (req, res) => {
+  const { id } = req.params;
+  const { title, description, priority, status, recipients, attachments } = req.body;
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    await connection.beginTransaction();
+
+    const noticeQuery = `
+      UPDATE notices
+      SET title = ?, description = ?, priority = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `;
+    await connection.execute(
+      noticeQuery,
+      [title, description, priority, status, id]
+    );
+
+    await connection.execute('DELETE FROM notice_recipients WHERE notice_id = ?', [id]);
+    await connection.execute('DELETE FROM notice_attachments WHERE notice_id = ?', [id]);
+
+    if (recipients && recipients.length > 0) {
+      for (const recipient of recipients) {
+        const recipientQuery = `
+          INSERT INTO notice_recipients (notice_id, recipient_type, recipient_id, recipient_name)
+          VALUES (?, ?, ?, ?)
+        `;
+        await connection.execute(
+          recipientQuery,
+          [id, recipient.type, recipient.value, recipient.label]
+        );
+      }
+    }
+
+    if (attachments && attachments.length > 0) {
+      for (const attachment of attachments) {
+        const attachmentQuery = `
+          INSERT INTO notice_attachments (notice_id, file_name, file_path, file_size, file_type, uploaded_by)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `;
+        await connection.execute(
+          attachmentQuery,
+          [id, attachment.name, attachment.path, attachment.size, attachment.type, attachment.uploaded_by]
+        );
+      }
+    }
+
+    await connection.commit();
+
+    res.json({ message: 'Notice updated successfully' });
+  } catch (err) {
+    if (connection) {
+      await connection.rollback();
+    }
+    console.error('Error updating notice:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.delete('/api/notices/:id', async (req, res) => {
+  const { id } = req.params;
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const [result] = await connection.execute('DELETE FROM notices WHERE id = ?', [id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Notice not found' });
+    }
+
+    res.json({ message: 'Notice deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting notice:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/notices/:id/mark-read', async (req, res) => {
+  const { id } = req.params;
+  const { userId } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: 'userId is required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const checkQuery = `
+      SELECT id
+      FROM notice_read_status
+      WHERE notice_id = ? AND user_id = ?
+    `;
+    const [existing] = await connection.execute(checkQuery, [id, userId]);
+
+    if (existing.length > 0) {
+      const updateQuery = `
+        UPDATE notice_read_status
+        SET is_read = TRUE, read_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+        WHERE notice_id = ? AND user_id = ?
+      `;
+      await connection.execute(updateQuery, [id, userId]);
+    } else {
+      const insertQuery = `
+        INSERT INTO notice_read_status (notice_id, user_id, is_read, read_at)
+        VALUES (?, ?, TRUE, CURRENT_TIMESTAMP)
+      `;
+      await connection.execute(insertQuery, [id, userId]);
+    }
+
+    res.json({ message: 'Notice marked as read' });
+  } catch (err) {
+    console.error('Error marking notice as read:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/notices/upload', async (req, res) => {
+  const upload = multer({
+    storage: multer.diskStorage({
+      destination: (req, file, cb) => {
+        const uploadDir = path.join(__dirname, 'uploads', 'notice-attachments');
+        if (!fs.existsSync(uploadDir)) {
+          fs.mkdirSync(uploadDir, { recursive: true });
+        }
+        cb(null, uploadDir);
+      },
+      filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
+        cb(null, uniqueSuffix + '-' + file.originalname);
+      }
+    }),
+    limits: {
+      fileSize: 10 * 1024 * 1024
+    }
+  }).array('files', 10);
+
+  upload(req, res, (err) => {
+    if (err) {
+      console.error('Notice attachment upload error:', err);
+      return res.status(400).json({ error: err.message });
+    }
+
+    if (!req.files || req.files.length === 0) {
+      return res.status(400).json({ error: 'No files uploaded' });
+    }
+
+    const files = req.files.map(file => ({
+      name: file.originalname,
+      path: file.path,
+      size: file.size,
+      type: file.mimetype
+    }));
+
+    res.json({ files });
+  });
+});
+
+// Authentication endpoint
+app.post('/api/auth', async (req, res) => {
+  const { username, password } = req.body;
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      SELECT id, name, role, permissions
+      FROM users
+      WHERE username = ? AND password = ?
+    `;
+
+    const [rows] = await connection.execute(query, [username, password]);
+
+    if (rows.length === 0) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const user = rows[0];
+    res.json({
+      id: user.id,
+      name: user.name,
+      role: user.role,
+      permissions: user.permissions ? JSON.parse(user.permissions) : []
+    });
+  } catch (err) {
+    console.error('Error authenticating user:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 // API Routes
 // Reports APIs
 // DWM Report - Get daily/weekly/monthly task completion statistics
@@ -387,7 +952,6 @@ app.get('/api/reports/dwm', async (req, res) => {
     }
     const [completedRows] = await connection.execute(completedQuery, completedParams);
     const [totalRows] = await connection.execute(totalQuery, totalParams);
-    
     console.log('🔍 DWM Debug - Completed Rows:', completedRows.length);
     console.log('🔍 DWM Debug - Total Data:', totalRows[0]);
     
@@ -2824,81 +3388,6 @@ app.get('/api/employees/:id/health', async (req, res) => {
           
           resolve();
         } catch (err) {
-          console.error('Error fetching attendance for absences:', err);
-          console.error('Attendance error details:', err.message);
-          console.error('Error stack:', err.stack);
-          
-          // Set default values when there's an error
-          calculations.attendance = {
-            absences: 0,
-            score: 0
-          };
-          
-          resolve();
-        }
-      }),
-      // 6. Calculate warning letters deductions
-      new Promise(async (resolve) => {
-        // Calculate warning letters cycle using dynamic settings
-        const warningCycleStart = new Date();
-        warningCycleStart.setDate(warningCycleStart.getDate() - healthSettings.warning_letters_cycle_offset_days);
-        warningCycleStart.setMonth(warningCycleStart.getMonth() - healthSettings.warning_letters_cycle_months);
-        
-        const warningCycleEnd = new Date();
-        warningCycleEnd.setDate(warningCycleEnd.getDate() - healthSettings.warning_letters_cycle_offset_days);
-        
-        const warningQuery = `
-          SELECT severity, COUNT(*) as count
-          FROM warning_letters 
-          WHERE employee_id = ? 
-          AND warning_date >= ? 
-          AND warning_date <= ?
-          AND status = 'Active'
-          GROUP BY severity
-        `;
-        
-        const startDateStr = warningCycleStart.toISOString().split('T')[0];
-        const endDateStr = warningCycleEnd.toISOString().split('T')[0];
-        
-        console.log('Fetching warning letters for employee:', employeeIdInt, 'from', startDateStr, 'to', endDateStr);
-        
-        try {
-          const [warnings] = await connection.execute(warningQuery, [employeeIdInt, startDateStr, endDateStr]);
-          
-          console.log('Found warning letters:', warnings);
-          
-          let warningDeduction = 0;
-          let highWarnings = 0, mediumWarnings = 0, lowWarnings = 0;
-          
-          if (warnings && warnings.length > 0) {
-            warnings.forEach(warning => {
-              console.log('Processing warning letter:', warning);
-              if (warning.severity === 'High') {
-                highWarnings = warning.count;
-                warningDeduction += warning.count * healthSettings.warning_letters_severity_high_deduction;
-              } else if (warning.severity === 'Medium') {
-                mediumWarnings = warning.count;
-                warningDeduction += warning.count * healthSettings.warning_letters_severity_medium_deduction;
-              } else if (warning.severity === 'Low') {
-                lowWarnings = warning.count;
-                warningDeduction += warning.count * healthSettings.warning_letters_severity_low_deduction;
-              }
-            });
-          } else {
-            console.log('No warning letters found for employee:', employeeId);
-          }
-          
-          console.log('Warning letters calculation result:', { highWarnings, mediumWarnings, lowWarnings, warningDeduction });
-          
-          calculations.warningLetters = {
-            high: highWarnings,
-            medium: mediumWarnings,
-            low: lowWarnings,
-            score: -warningDeduction
-          };
-          
-          resolve();
-        } catch (err) {
           console.error('Error fetching warning letters:', err);
           console.error('Warning letters error details:', err.message);
           console.error('Error stack:', err.stack);
@@ -3113,7 +3602,6 @@ app.post('/api/employees', async (req, res) => {
     }
   }
 });
-
 // Update employee
 app.put('/api/employees/:id', async (req, res) => {
   const employeeData = req.body;
@@ -5682,7 +6170,6 @@ app.post('/api/tasks/import', upload.single('file'), async (req, res) => {
         values.push(current.trim().replace(/^"(.*)"$/, '$1')); // Add the last value and remove quotes
         return values;
       };
-      
       const headers = parseCSVLine(lines[0]);
       const dataRows = lines.slice(1);
       console.log('CSV Headers:', headers);
@@ -5898,8 +6385,6 @@ app.post('/api/tasks/import', upload.single('file'), async (req, res) => {
     res.status(500).json({ error: 'Error processing file' });
   }
 });
-
-
 // Update existing tasks from file
 app.post('/api/tasks/update', upload.single('file'), async (req, res) => {
   console.log('=== TASK UPDATE REQUEST RECEIVED ===');
@@ -6517,12 +7002,10 @@ app.get('/api/notifications/dwm-incomplete', async (req, res) => {
     const apparelQuery = `SELECT id, title, labels, status, department, assigned_to FROM tasks WHERE LOWER(title) LIKE '%apparel%'`;
     const [apparelRows] = await connection.execute(apparelQuery);
     console.log('🔔 DWM Debug: Apparel tasks:', apparelRows);
-
     // Check task history for completion tracking
     const historyQuery = `SELECT task_id, action, new_value, created_at FROM task_history WHERE action = 'Status changed' AND new_value = 'Completed' AND DATE(CONVERT_TZ(created_at, '+00:00', '+05:00')) = ? ORDER BY created_at DESC LIMIT 10`;
     const [historyRows] = await connection.execute(historyQuery, [date]);
     console.log('🔔 DWM Debug: Recent completions on', date, ':', historyRows);
-
     // Also check if there are any tasks with 'Daily Task' in the title
     const dailyTitleQuery = `SELECT id, title, labels, status FROM tasks WHERE LOWER(title) LIKE '%daily task%'`;
     const [dailyTitleRows] = await connection.execute(dailyTitleQuery);
@@ -6655,6 +7138,608 @@ app.get('/api/notifications/dwm-incomplete', async (req, res) => {
   }
 });
 
+// Ticket Notifications API Routes
+app.get('/api/notifications', async (req, res) => {
+  const { user_id } = req.query;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      SELECT 
+        tn.id,
+        tn.user_id,
+        tn.ticket_id,
+        tn.notification_type,
+        tn.title,
+        tn.message,
+        tn.is_read,
+        tn.created_at,
+        tn.read_at,
+        t.ticket_number,
+        t.title as ticket_title
+      FROM ticket_notifications tn
+      LEFT JOIN tickets t ON tn.ticket_id = t.id
+      WHERE tn.user_id = ?
+      ORDER BY tn.created_at DESC
+      LIMIT 50
+    `;
+
+    const [notifications] = await connection.execute(query, [user_id]);
+    res.json(notifications);
+  } catch (err) {
+    console.error('Error fetching notifications:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/notifications/unread-count', async (req, res) => {
+  const { user_id } = req.query;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      SELECT COUNT(*) as unread_count
+      FROM ticket_notifications
+      WHERE user_id = ? AND is_read = FALSE
+    `;
+
+    const [result] = await connection.execute(query, [user_id]);
+    res.json({ unread_count: result[0].unread_count });
+  } catch (err) {
+    console.error('Error fetching unread count:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.put('/api/notifications/:id/read', async (req, res) => {
+  const { id } = req.params;
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      UPDATE ticket_notifications 
+      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `;
+
+    const [result] = await connection.execute(query, [id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    res.json({ message: 'Notification marked as read' });
+  } catch (err) {
+    console.error('Error marking notification as read:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.put('/api/notifications/mark-all-read', async (req, res) => {
+  const { user_id } = req.body;
+
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id is required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      UPDATE ticket_notifications 
+      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
+      WHERE user_id = ? AND is_read = FALSE
+    `;
+
+    const [result] = await connection.execute(query, [user_id]);
+
+    res.json({
+      message: 'All notifications marked as read',
+      updated_count: result.affectedRows
+    });
+  } catch (err) {
+    console.error('Error marking all notifications as read:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.delete('/api/notifications/:id', async (req, res) => {
+  const { id } = req.params;
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const [result] = await connection.execute('DELETE FROM ticket_notifications WHERE id = ?', [id]);
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    res.json({ message: 'Notification deleted successfully' });
+  } catch (err) {
+    console.error('Error deleting notification:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.put('/api/notifications/mark-ticket-read', async (req, res) => {
+  const { user_id, ticket_id } = req.body;
+
+  if (!user_id || !ticket_id) {
+    return res.status(400).json({ error: 'user_id and ticket_id are required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      UPDATE ticket_notifications 
+      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
+      WHERE user_id = ? AND ticket_id = ? AND is_read = FALSE
+    `;
+
+    const [result] = await connection.execute(query, [user_id, ticket_id]);
+
+    res.json({
+      message: 'Ticket notifications marked as read',
+      updated_count: result.affectedRows
+    });
+  } catch (err) {
+    console.error('Error marking ticket notifications as read:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/clet-notifications', async (req, res) => {
+  const userRole = req.headers['x-user-role'];
+  const userPermissions = req.headers['x-user-permissions'];
+
+  if (!userRole || !userPermissions) {
+    return res.status(401).json({ error: 'User role and permissions required' });
+  }
+
+  let permissions;
+  try {
+    permissions = JSON.parse(userPermissions);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid permissions format' });
+  }
+
+  if (!permissions.includes('clet_view') && !permissions.includes('all') && userRole !== 'admin') {
+    console.log(`Access denied: User role ${userRole} attempted to access CLET notifications without permission`);
+    return res.status(403).json({
+      error: 'Access denied. You do not have permission to view CLET notifications.',
+      requiredPermission: 'clet_view'
+    });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    console.log('🔔 CLET Notifications: Fetching tasks missing checklist or estimated time');
+
+    const query = `
+      SELECT DISTINCT
+        t.id,
+        t.title,
+        t.description,
+        t.department,
+        t.assigned_to,
+        t.labels,
+        t.priority,
+        t.status,
+        t.time_estimate_hours,
+        t.time_estimate_minutes,
+        t.checklist,
+        CASE 
+          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%' OR LOWER(IFNULL(t.labels,'')) LIKE '%daily task%' THEN 'Daily Task'
+          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%' OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly task%' THEN 'Weekly Task'
+          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%' OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly task%' THEN 'Monthly Task'
+          ELSE 'Unknown'
+        END as task_type,
+        CASE 
+          WHEN (t.time_estimate_hours IS NULL OR t.time_estimate_hours = 0) 
+               AND (t.time_estimate_minutes IS NULL OR t.time_estimate_minutes = 0)
+               AND (t.checklist IS NULL OR t.checklist = '' OR t.checklist = '[]' OR t.checklist = 'null') 
+          THEN 'Both Missing'
+          WHEN (t.time_estimate_hours IS NULL OR t.time_estimate_hours = 0) 
+               AND (t.time_estimate_minutes IS NULL OR t.time_estimate_minutes = 0)
+          THEN 'Estimated Time Missing'
+          WHEN (t.checklist IS NULL OR t.checklist = '' OR t.checklist = '[]' OR t.checklist = 'null') 
+          THEN 'Checklist Missing'
+          ELSE 'Unknown'
+        END as missing_type
+      FROM tasks t
+      WHERE (
+        LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%'
+        OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%'
+        OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%'
+        OR LOWER(IFNULL(t.labels,'')) LIKE '%daily task%'
+        OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly task%'
+        OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly task%'
+      )
+      AND (
+        ((t.time_estimate_hours IS NULL OR t.time_estimate_hours = 0) 
+         AND (t.time_estimate_minutes IS NULL OR t.time_estimate_minutes = 0))
+        OR (t.checklist IS NULL OR t.checklist = '' OR t.checklist = '[]' OR t.checklist = 'null')
+      )
+      AND t.status != 'Completed'
+      ORDER BY t.priority DESC, t.department, t.assigned_to
+    `;
+
+    console.log('🔔 CLET Debug: Executing CLET query');
+    const [rows] = await connection.execute(query);
+    console.log('🔔 CLET Debug: Query result rows:', rows.length);
+
+    const formattedNotifications = rows.map(row => ({
+      id: row.id,
+      taskTitle: row.title,
+      taskDescription: row.description,
+      department: row.department || 'Unassigned',
+      employeeName: row.assigned_to || 'Unassigned',
+      taskType: row.task_type,
+      priority: row.priority || 'Medium',
+      status: row.status,
+      labels: row.labels,
+      timeEstimateHours: row.time_estimate_hours,
+      timeEstimateMinutes: row.time_estimate_minutes,
+      checklist: row.checklist,
+      missingType: row.missing_type
+    }));
+
+    res.json(formattedNotifications);
+  } catch (err) {
+    console.error('Error fetching CLET notifications:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/notifications/consecutive-absences', async (req, res) => {
+  const userRole = req.headers['x-user-role'];
+  const userPermissions = req.headers['x-user-permissions'];
+
+  if (!userRole || !userPermissions) {
+    return res.status(401).json({ error: 'User role and permissions required' });
+  }
+
+  let permissions;
+  try {
+    permissions = JSON.parse(userPermissions);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid permissions format' });
+  }
+
+  if (!permissions.includes('ca_view') && !permissions.includes('all') && userRole !== 'admin' && userRole !== 'Admin') {
+    console.log(`Access denied: User role ${userRole} attempted to access CA notifications without permission`);
+    return res.status(403).json({
+      error: 'Access denied. You do not have permission to view CA notifications.',
+      requiredPermission: 'ca_view'
+    });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    console.log('🔔 Consecutive Absence Notifications: Fetching employees with consecutive absences');
+
+    const [employees] = await connection.execute(`
+      SELECT id, name, email, department FROM employees
+    `);
+
+    const consecutiveAbsenceEmployees = [];
+
+    for (const employee of employees) {
+      const [attendanceRecords] = await connection.execute(`
+        SELECT date 
+        FROM attendance 
+        WHERE employee_id = ? 
+        AND date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+        ORDER BY date DESC
+      `, [employee.id]);
+
+      const presentDates = new Set(attendanceRecords.map(record => record.date.toISOString().split('T')[0]));
+
+      let maxConsecutiveAbsentDays = 0;
+      let currentConsecutiveAbsentDays = 0;
+
+      for (let i = 0; i < 30; i++) {
+        const checkDate = new Date();
+        checkDate.setDate(checkDate.getDate() - i);
+        const dateString = checkDate.toISOString().split('T')[0];
+
+        if (checkDate.getDay() === 0 || checkDate.getDay() === 6) {
+          continue;
+        }
+
+        if (presentDates.has(dateString)) {
+          currentConsecutiveAbsentDays = 0;
+        } else {
+          currentConsecutiveAbsentDays++;
+          maxConsecutiveAbsentDays = Math.max(maxConsecutiveAbsentDays, currentConsecutiveAbsentDays);
+        }
+      }
+
+      if (maxConsecutiveAbsentDays >= 3) {
+        const lastAttendanceDate = attendanceRecords[0]?.date || null;
+        consecutiveAbsenceEmployees.push({
+          id: employee.id,
+          employeeName: employee.name,
+          employeeEmail: employee.email,
+          department: employee.department || 'Unassigned',
+          consecutiveAbsentDays: maxConsecutiveAbsentDays,
+          lastAttendanceDate: lastAttendanceDate,
+          daysSinceLastAttendance: lastAttendanceDate ? 
+            Math.floor((new Date() - new Date(lastAttendanceDate)) / (1000 * 60 * 60 * 24)) : 
+            null
+        });
+      }
+    }
+
+    console.log(`🔔 Consecutive Absence Debug: Found ${consecutiveAbsenceEmployees.length} employees with consecutive absences`);
+
+    res.json(consecutiveAbsenceEmployees);
+  } catch (err) {
+    console.error('Error fetching consecutive absence notifications:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/notifications/missed-tasks', async (req, res) => {
+  const userRole = req.headers['x-user-role'];
+  const userPermissions = req.headers['x-user-permissions'];
+  const { days = 7 } = req.query;
+
+  if (!userRole || !userPermissions) {
+    return res.status(401).json({ error: 'User role and permissions required' });
+  }
+
+  let permissions;
+  try {
+    permissions = JSON.parse(userPermissions);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid permissions format' });
+  }
+
+  if (!permissions.includes('mtw_view') && !permissions.includes('all') && userRole !== 'admin' && userRole !== 'Admin') {
+    console.log(`Access denied: User role ${userRole} attempted to access MTW notifications without permission`);
+    return res.status(403).json({
+      error: 'Access denied. You do not have permission to view MTW notifications.',
+      requiredPermission: 'mtw_view'
+    });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    console.log(`🔔 MTW Notifications: Fetching tasks missed for ${days} days`);
+
+    const query = `
+      SELECT 
+        t.id,
+        t.title,
+        t.description,
+        t.department,
+        t.assigned_to,
+        t.priority,
+        t.status,
+        t.created_at,
+        t.updated_at,
+        t.due_date,
+        t.labels,
+        DATEDIFF(CURDATE(), t.created_at) as days_since_creation
+      FROM tasks t
+      WHERE 
+        t.status != 'Completed'
+        AND DATEDIFF(CURDATE(), t.created_at) >= ?
+        AND (
+          LOWER(IFNULL(t.labels,'')) NOT LIKE '%daily%'
+          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%weekly%'
+          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%monthly%'
+          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%daily-task%'
+          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%weekly-task%'
+          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%monthly-task%'
+        )
+      ORDER BY t.department, t.priority DESC, t.created_at ASC
+    `;
+
+    console.log('🔔 MTW Debug: Executing query with days parameter:', days);
+    const [rows] = await connection.execute(query, [parseInt(days)]);
+    console.log(`🔔 MTW Debug: Query result rows: ${rows.length}`);
+
+    const formattedNotifications = rows.map(row => ({
+      id: row.id,
+      taskTitle: row.title,
+      taskDescription: row.description,
+      department: row.department || 'Unassigned',
+      assignedTo: row.assigned_to || 'Unassigned',
+      priority: row.priority || 'Medium',
+      status: row.status,
+      createdDate: row.created_at,
+      updatedDate: row.updated_at,
+      dueDate: row.due_date,
+      labels: row.labels,
+      daysSinceCreation: row.days_since_creation
+    }));
+
+    res.json(formattedNotifications);
+  } catch (err) {
+    console.error('Error fetching MTW notifications:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/notifications/less-trained-employees', async (req, res) => {
+  const userRole = req.headers['x-user-role'];
+  const userPermissions = req.headers['x-user-permissions'];
+  const { minTrained = 3 } = req.query;
+
+  if (!userRole || !userPermissions) {
+    return res.status(401).json({ error: 'User role and permissions required' });
+  }
+
+  let permissions;
+  try {
+    permissions = JSON.parse(userPermissions);
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid permissions format' });
+  }
+
+  if (!permissions.includes('lte_view') && !permissions.includes('all') && userRole !== 'admin' && userRole !== 'Admin') {
+    console.log(`Access denied: User role ${userRole} attempted to access LTE notifications without permission`);
+    return res.status(403).json({
+      error: 'Access denied. You do not have permission to view LTE notifications.',
+      requiredPermission: 'lte_view'
+    });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    console.log(`🔔 LTE Notifications: Fetching DWM tasks with less than ${minTrained} trained employees`);
+
+    const query = `
+      SELECT 
+        t.id,
+        t.title,
+        t.description,
+        t.department,
+        t.assigned_to,
+        t.priority,
+        t.status,
+        t.created_at,
+        t.updated_at,
+        t.due_date,
+        t.labels,
+        t.trained,
+        CASE 
+          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%daily%' OR LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%' THEN 'Daily'
+          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%weekly%' OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%' THEN 'Weekly'
+          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%monthly%' OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%' THEN 'Monthly'
+          ELSE 'Unknown'
+        END as task_type,
+        CASE 
+          WHEN t.trained IS NULL OR t.trained = '' OR t.trained = 'null' THEN 0
+          ELSE JSON_LENGTH(t.trained)
+        END as trained_count
+      FROM tasks t
+      WHERE 
+        (
+          LOWER(IFNULL(t.labels,'')) LIKE '%daily%'
+          OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly%'
+          OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly%'
+          OR LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%'
+          OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%'
+          OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%'
+        )
+        AND (
+          t.trained IS NULL 
+          OR t.trained = '' 
+          OR t.trained = 'null'
+          OR JSON_LENGTH(t.trained) < ?
+        )
+      ORDER BY t.department, t.priority DESC, t.created_at ASC
+    `;
+
+    console.log('🔔 LTE Debug: Executing query with minTrained parameter:', minTrained);
+    const [rows] = await connection.execute(query, [parseInt(minTrained)]);
+    console.log(`🔔 LTE Debug: Query result rows: ${rows.length}`);
+
+    const formattedNotifications = rows.map(row => ({
+      id: row.id,
+      taskTitle: row.title,
+      taskDescription: row.description,
+      department: row.department || 'Unassigned',
+      assignedTo: row.assigned_to || 'Unassigned',
+      priority: row.priority || 'Medium',
+      status: row.status,
+      createdDate: row.created_at,
+      updatedDate: row.updated_at,
+      dueDate: row.due_date,
+      labels: row.labels,
+      taskType: row.task_type,
+      trained: row.trained,
+      trainedCount: row.trained_count,
+      requiredCount: parseInt(minTrained)
+    }));
+
+    res.json(formattedNotifications);
+  } catch (err) {
+    console.error('Error fetching LTE notifications:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 
 
 // Helper: reset recurring tasks to Pending (labels include daily/weekly/monthly)
@@ -6689,7 +7774,6 @@ app.post('/api/admin/reset-recurring', async (req, res) => {
     res.status(500).json({ error: 'Database error' });
   }
 });
-
 // ===== Daily reset of recurring tasks (Pakistan time) =====
 // Reset status to Pending at local midnight in Asia/Karachi for tasks labeled daily/weekly/monthly
 (function setupDailyRecurringTaskReset() {
@@ -6719,6 +7803,88 @@ app.post('/api/admin/reset-recurring', async (req, res) => {
     }
   }, 60 * 1000); // check every minute
 })();
+
+app.get('/api/warning-letter-types', async (req, res) => {
+  const query = 'SELECT id, name, status, created_at FROM warning_letter_types WHERE status = "Active" ORDER BY name ASC';
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const [rows] = await connection.execute(query);
+    res.json(rows);
+  } catch (err) {
+    console.error('Error fetching warning letter types:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/warning-letter-types', async (req, res) => {
+  const { name } = req.body;
+  if (!name || !String(name).trim()) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const insert = 'INSERT INTO warning_letter_types (name) VALUES (?)';
+    const [result] = await connection.execute(insert, [String(name).trim()]);
+
+    const [rows] = await connection.execute(
+      'SELECT id, name, status, created_at FROM warning_letter_types WHERE id = ?',
+      [result.insertId]
+    );
+
+    if (rows.length > 0) {
+      res.status(201).json(rows[0]);
+    } else {
+      res.status(201).json({ id: result.insertId, message: 'Saved' });
+    }
+  } catch (err) {
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ error: 'This warning letter type already exists' });
+    }
+    console.error('Error creating warning letter type:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.get('/api/warning-letters', async (req, res) => {
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const query = `
+      SELECT wl.id, wl.employee_id, wl.employee_name, wl.title, wl.description, wl.warning_date, wl.severity, wl.created_at
+      FROM warning_letters wl 
+      ORDER BY wl.created_at DESC
+    `;
+
+    const [warningLetters] = await connection.execute(query);
+    res.json(warningLetters);
+  } catch (err) {
+    console.error('Error fetching warning letters:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
 // Delete multiple warning letters (bulk delete)
 app.delete('/api/warning-letters/bulk', async (req, res) => {
   const { ids } = req.body;
@@ -7481,7 +8647,6 @@ app.put('/api/tickets/:ticketId/replies/:replyId', async (req, res) => {
     }
   }
 });
-
 // Delete a reply
 app.delete('/api/tickets/:ticketId/replies/:replyId', async (req, res) => {
   const { ticketId, replyId } = req.params;
@@ -7500,778 +8665,6 @@ app.delete('/api/tickets/:ticketId/replies/:replyId', async (req, res) => {
     res.json({ message: 'Reply deleted successfully' });
   } catch (err) {
     console.error('Error deleting ticket reply:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-// Helper function to create notifications
-const createNotification = async (userId, ticketId, type, title, message) => {
-  let connection;
-  try {
-    console.log('Creating notification:', { userId, ticketId, type, title, message });
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      INSERT INTO ticket_notifications (user_id, ticket_id, notification_type, title, message)
-      VALUES (?, ?, ?, ?, ?)
-    `;
-    
-    const [result] = await connection.execute(query, [userId, ticketId, type, title, message]);
-    console.log('Notification inserted with ID:', result.insertId);
-  } catch (err) {
-    console.error('Error creating notification:', err);
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-};
-// Ticket Notifications API Routes
-// Get notifications for a user
-app.get('/api/notifications', async (req, res) => {
-  const { user_id } = req.query;
-  
-  if (!user_id) {
-    return res.status(400).json({ error: 'user_id is required' });
-  }
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      SELECT 
-        tn.id,
-        tn.user_id,
-        tn.ticket_id,
-        tn.notification_type,
-        tn.title,
-        tn.message,
-        tn.is_read,
-        tn.created_at,
-        tn.read_at,
-        t.ticket_number,
-        t.title as ticket_title
-      FROM ticket_notifications tn
-      LEFT JOIN tickets t ON tn.ticket_id = t.id
-      WHERE tn.user_id = ?
-      ORDER BY tn.created_at DESC
-      LIMIT 50
-    `;
-    
-    const [notifications] = await connection.execute(query, [user_id]);
-    res.json(notifications);
-  } catch (err) {
-    console.error('Error fetching notifications:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Get unread notification count
-app.get('/api/notifications/unread-count', async (req, res) => {
-  const { user_id } = req.query;
-  
-  if (!user_id) {
-    return res.status(400).json({ error: 'user_id is required' });
-  }
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      SELECT COUNT(*) as unread_count
-      FROM ticket_notifications
-      WHERE user_id = ? AND is_read = FALSE
-    `;
-    
-    const [result] = await connection.execute(query, [user_id]);
-    res.json({ unread_count: result[0].unread_count });
-  } catch (err) {
-    console.error('Error fetching unread count:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-// Mark notification as read
-app.put('/api/notifications/:id/read', async (req, res) => {
-  const { id } = req.params;
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      UPDATE ticket_notifications 
-      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
-      WHERE id = ?
-    `;
-    
-    const [result] = await connection.execute(query, [id]);
-    
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Notification not found' });
-    }
-    
-    res.json({ message: 'Notification marked as read' });
-  } catch (err) {
-    console.error('Error marking notification as read:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Mark all notifications as read for a user
-app.put('/api/notifications/mark-all-read', async (req, res) => {
-  const { user_id } = req.body;
-  
-  if (!user_id) {
-    return res.status(400).json({ error: 'user_id is required' });
-  }
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      UPDATE ticket_notifications 
-      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
-      WHERE user_id = ? AND is_read = FALSE
-    `;
-    
-    const [result] = await connection.execute(query, [user_id]);
-    
-    res.json({ 
-      message: 'All notifications marked as read',
-      updated_count: result.affectedRows
-    });
-  } catch (err) {
-    console.error('Error marking all notifications as read:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Delete notification
-app.delete('/api/notifications/:id', async (req, res) => {
-  const { id } = req.params;
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const [result] = await connection.execute('DELETE FROM ticket_notifications WHERE id = ?', [id]);
-    
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Notification not found' });
-    }
-    
-    res.json({ message: 'Notification deleted successfully' });
-  } catch (err) {
-    console.error('Error deleting notification:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// Mark all notifications for a specific ticket as read
-app.put('/api/notifications/mark-ticket-read', async (req, res) => {
-  const { user_id, ticket_id } = req.body;
-  
-  if (!user_id || !ticket_id) {
-    return res.status(400).json({ error: 'user_id and ticket_id are required' });
-  }
-  
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-    
-    const query = `
-      UPDATE ticket_notifications 
-      SET is_read = TRUE, read_at = CURRENT_TIMESTAMP
-      WHERE user_id = ? AND ticket_id = ? AND is_read = FALSE
-    `;
-    
-    const [result] = await connection.execute(query, [user_id, ticket_id]);
-    
-    res.json({ 
-      message: 'Ticket notifications marked as read',
-      updated_count: result.affectedRows
-    });
-  } catch (err) {
-    console.error('Error marking ticket notifications as read:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-
-// CLET Notifications - Tasks missing checklist or estimated time with Daily/Weekly/Monthly labels
-app.get('/api/clet-notifications', async (req, res) => {
-  // Check if user has clet_view permission
-  const userRole = req.headers['x-user-role'];
-  const userPermissions = req.headers['x-user-permissions'];
-  
-  if (!userRole || !userPermissions) {
-    return res.status(401).json({ error: 'User role and permissions required' });
-  }
-
-  let permissions;
-  try {
-    permissions = JSON.parse(userPermissions);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid permissions format' });
-  }
-
-  // Check if user has clet_view permission or is admin
-  if (!permissions.includes('clet_view') && !permissions.includes('all') && userRole !== 'admin') {
-    console.log(`Access denied: User role ${userRole} attempted to access CLET notifications without permission`);
-    return res.status(403).json({ 
-      error: 'Access denied. You do not have permission to view CLET notifications.',
-      requiredPermission: 'clet_view'
-    });
-  }
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-
-    console.log('🔔 CLET Notifications: Fetching tasks missing checklist or estimated time');
-
-    // Query to find tasks with Daily/Weekly/Monthly labels that are missing checklist or estimated time
-    const query = `
-      SELECT DISTINCT
-        t.id,
-        t.title,
-        t.description,
-        t.department,
-        t.assigned_to,
-        t.labels,
-        t.priority,
-        t.status,
-        t.time_estimate_hours,
-        t.time_estimate_minutes,
-        t.checklist,
-        CASE 
-          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%' OR LOWER(IFNULL(t.labels,'')) LIKE '%daily task%' THEN 'Daily Task'
-          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%' OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly task%' THEN 'Weekly Task'
-          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%' OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly task%' THEN 'Monthly Task'
-          ELSE 'Unknown'
-        END as task_type,
-        CASE 
-          WHEN (t.time_estimate_hours IS NULL OR t.time_estimate_hours = 0) 
-               AND (t.time_estimate_minutes IS NULL OR t.time_estimate_minutes = 0)
-               AND (t.checklist IS NULL OR t.checklist = '' OR t.checklist = '[]' OR t.checklist = 'null') 
-          THEN 'Both Missing'
-          WHEN (t.time_estimate_hours IS NULL OR t.time_estimate_hours = 0) 
-               AND (t.time_estimate_minutes IS NULL OR t.time_estimate_minutes = 0)
-          THEN 'Estimated Time Missing'
-          WHEN (t.checklist IS NULL OR t.checklist = '' OR t.checklist = '[]' OR t.checklist = 'null') 
-          THEN 'Checklist Missing'
-          ELSE 'Unknown'
-        END as missing_type
-      FROM tasks t
-      WHERE (
-        LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%'
-        OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%'
-        OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%'
-        OR LOWER(IFNULL(t.labels,'')) LIKE '%daily task%'
-        OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly task%'
-        OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly task%'
-      )
-      AND (
-        ((t.time_estimate_hours IS NULL OR t.time_estimate_hours = 0) 
-         AND (t.time_estimate_minutes IS NULL OR t.time_estimate_minutes = 0))
-        OR (t.checklist IS NULL OR t.checklist = '' OR t.checklist = '[]' OR t.checklist = 'null')
-      )
-      AND t.status != 'Completed'
-      ORDER BY t.priority DESC, t.department, t.assigned_to
-    `;
-
-    console.log('🔔 CLET Debug: Executing CLET query');
-    const [rows] = await connection.execute(query);
-    console.log('🔔 CLET Debug: Query result rows:', rows.length);
-
-    // Format the response for the frontend
-    const formattedNotifications = rows.map(row => ({
-      id: row.id,
-      taskTitle: row.title,
-      taskDescription: row.description,
-      department: row.department || 'Unassigned',
-      employeeName: row.assigned_to || 'Unassigned',
-      taskType: row.task_type,
-      priority: row.priority || 'Medium',
-      status: row.status,
-      labels: row.labels,
-      timeEstimateHours: row.time_estimate_hours,
-      timeEstimateMinutes: row.time_estimate_minutes,
-      checklist: row.checklist,
-      missingType: row.missing_type
-    }));
-
-    res.json(formattedNotifications);
-  } catch (err) {
-    console.error('Error fetching CLET notifications:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-// Consecutive Absence Notifications API
-app.get('/api/notifications/consecutive-absences', async (req, res) => {
-  // Check if user has ca_view permission
-  const userRole = req.headers['x-user-role'];
-  const userPermissions = req.headers['x-user-permissions'];
-  
-  if (!userRole || !userPermissions) {
-    return res.status(401).json({ error: 'User role and permissions required' });
-  }
-
-  let permissions;
-  try {
-    permissions = JSON.parse(userPermissions);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid permissions format' });
-  }
-
-  // Check if user has ca_view permission or is admin
-  if (!permissions.includes('ca_view') && !permissions.includes('all') && userRole !== 'admin' && userRole !== 'Admin') {
-    console.log(`Access denied: User role ${userRole} attempted to access CA notifications without permission`);
-    return res.status(403).json({ 
-      error: 'Access denied. You do not have permission to view CA notifications.',
-      requiredPermission: 'ca_view'
-    });
-  }
-
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-
-    console.log('🔔 Consecutive Absence Notifications: Fetching employees with consecutive absences');
-
-    // Get all employees
-    const [employees] = await connection.execute(`
-      SELECT id, name, email, department FROM employees
-    `);
-
-    const consecutiveAbsenceEmployees = [];
-
-    // For each employee, check for consecutive absences in the last 30 days
-    for (const employee of employees) {
-      // Get attendance records for the last 30 days
-      const [attendanceRecords] = await connection.execute(`
-        SELECT date 
-        FROM attendance 
-        WHERE employee_id = ? 
-        AND date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
-        ORDER BY date DESC
-      `, [employee.id]);
-
-      // Create a set of dates when employee was present
-      const presentDates = new Set(attendanceRecords.map(record => record.date.toISOString().split('T')[0]));
-
-      // Check for consecutive absences (3 or more consecutive days without attendance)
-      let maxConsecutiveAbsentDays = 0;
-      let currentConsecutiveAbsentDays = 0;
-
-      // Check each day for the last 30 days
-      for (let i = 0; i < 30; i++) {
-        const checkDate = new Date();
-        checkDate.setDate(checkDate.getDate() - i);
-        const dateString = checkDate.toISOString().split('T')[0];
-
-        // Skip weekends (Saturday = 6, Sunday = 0)
-        if (checkDate.getDay() === 0 || checkDate.getDay() === 6) {
-          continue;
-        }
-
-        // If employee was present on this date
-        if (presentDates.has(dateString)) {
-          currentConsecutiveAbsentDays = 0;
-        } else {
-          // Employee was absent
-          currentConsecutiveAbsentDays++;
-          maxConsecutiveAbsentDays = Math.max(maxConsecutiveAbsentDays, currentConsecutiveAbsentDays);
-        }
-      }
-
-      if (maxConsecutiveAbsentDays >= 3) {
-        const lastAttendanceDate = attendanceRecords[0]?.date || null;
-        consecutiveAbsenceEmployees.push({
-          id: employee.id,
-          employeeName: employee.name,
-          employeeEmail: employee.email,
-          department: employee.department || 'Unassigned',
-          consecutiveAbsentDays: maxConsecutiveAbsentDays,
-          lastAttendanceDate: lastAttendanceDate,
-          daysSinceLastAttendance: lastAttendanceDate ? 
-            Math.floor((new Date() - new Date(lastAttendanceDate)) / (1000 * 60 * 60 * 24)) : 
-            null
-        });
-      }
-    }
-
-    console.log(`🔔 Consecutive Absence Debug: Found ${consecutiveAbsenceEmployees.length} employees with consecutive absences`);
-
-    res.json(consecutiveAbsenceEmployees);
-  } catch (err) {
-    console.error('Error fetching consecutive absence notifications:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-// Missed Task Week (MTW) Notifications API
-app.get('/api/notifications/missed-tasks', async (req, res) => {
-  // Check if user has mtw_view permission
-  const userRole = req.headers['x-user-role'];
-  const userPermissions = req.headers['x-user-permissions'];
-  const { days = 7 } = req.query; // Default to 7 days, configurable
-  
-  if (!userRole || !userPermissions) {
-    return res.status(401).json({ error: 'User role and permissions required' });
-  }
-
-  let permissions;
-  try {
-    permissions = JSON.parse(userPermissions);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid permissions format' });
-  }
-
-  // Check if user has mtw_view permission or is admin
-  if (!permissions.includes('mtw_view') && !permissions.includes('all') && userRole !== 'admin' && userRole !== 'Admin') {
-    console.log(`Access denied: User role ${userRole} attempted to access MTW notifications without permission`);
-    return res.status(403).json({ 
-      error: 'Access denied. You do not have permission to view MTW notifications.',
-      requiredPermission: 'mtw_view'
-    });
-  }
-
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-
-    console.log(`🔔 MTW Notifications: Fetching tasks missed for ${days} days`);
-
-    const query = `
-      SELECT 
-        t.id,
-        t.title,
-        t.description,
-        t.department,
-        t.assigned_to,
-        t.priority,
-        t.status,
-        t.created_at,
-        t.updated_at,
-        t.due_date,
-        t.labels,
-        DATEDIFF(CURDATE(), t.created_at) as days_since_creation
-      FROM tasks t
-      WHERE 
-        t.status != 'Completed'
-        AND DATEDIFF(CURDATE(), t.created_at) >= ?
-        AND (
-          LOWER(IFNULL(t.labels,'')) NOT LIKE '%daily%'
-          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%weekly%'
-          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%monthly%'
-          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%daily-task%'
-          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%weekly-task%'
-          AND LOWER(IFNULL(t.labels,'')) NOT LIKE '%monthly-task%'
-        )
-      ORDER BY t.department, t.priority DESC, t.created_at ASC
-    `;
-
-    console.log('🔔 MTW Debug: Executing query with days parameter:', days);
-    const [rows] = await connection.execute(query, [parseInt(days)]);
-    console.log(`🔔 MTW Debug: Query result rows: ${rows.length}`);
-
-    // Format the response for the frontend
-    const formattedNotifications = rows.map(row => ({
-      id: row.id,
-      taskTitle: row.title,
-      taskDescription: row.description,
-      department: row.department || 'Unassigned',
-      assignedTo: row.assigned_to || 'Unassigned',
-      priority: row.priority || 'Medium',
-      status: row.status,
-      createdDate: row.created_at,
-      updatedDate: row.updated_at,
-      dueDate: row.due_date,
-      labels: row.labels,
-      daysSinceCreation: row.days_since_creation
-    }));
-
-    res.json(formattedNotifications);
-  } catch (err) {
-    console.error('Error fetching MTW notifications:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-// Less Trained Employees (LTE) Notifications API
-app.get('/api/notifications/less-trained-employees', async (req, res) => {
-  // Check if user has lte_view permission
-  const userRole = req.headers['x-user-role'];
-  const userPermissions = req.headers['x-user-permissions'];
-  const { minTrained = 3 } = req.query; // Default to 3 employees, configurable
-  
-  if (!userRole || !userPermissions) {
-    return res.status(401).json({ error: 'User role and permissions required' });
-  }
-
-  let permissions;
-  try {
-    permissions = JSON.parse(userPermissions);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid permissions format' });
-  }
-
-  // Check if user has lte_view permission or is admin
-  if (!permissions.includes('lte_view') && !permissions.includes('all') && userRole !== 'admin' && userRole !== 'Admin') {
-    console.log(`Access denied: User role ${userRole} attempted to access LTE notifications without permission`);
-    return res.status(403).json({ 
-      error: 'Access denied. You do not have permission to view LTE notifications.',
-      requiredPermission: 'lte_view'
-    });
-  }
-
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-
-    console.log(`🔔 LTE Notifications: Fetching DWM tasks with less than ${minTrained} trained employees`);
-
-    const query = `
-      SELECT 
-        t.id,
-        t.title,
-        t.description,
-        t.department,
-        t.assigned_to,
-        t.priority,
-        t.status,
-        t.created_at,
-        t.updated_at,
-        t.due_date,
-        t.labels,
-        t.trained,
-        CASE 
-          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%daily%' OR LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%' THEN 'Daily'
-          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%weekly%' OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%' THEN 'Weekly'
-          WHEN LOWER(IFNULL(t.labels,'')) LIKE '%monthly%' OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%' THEN 'Monthly'
-          ELSE 'Unknown'
-        END as task_type,
-        CASE 
-          WHEN t.trained IS NULL OR t.trained = '' OR t.trained = 'null' THEN 0
-          ELSE JSON_LENGTH(t.trained)
-        END as trained_count
-      FROM tasks t
-      WHERE 
-        (
-          LOWER(IFNULL(t.labels,'')) LIKE '%daily%'
-          OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly%'
-          OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly%'
-          OR LOWER(IFNULL(t.labels,'')) LIKE '%daily-task%'
-          OR LOWER(IFNULL(t.labels,'')) LIKE '%weekly-task%'
-          OR LOWER(IFNULL(t.labels,'')) LIKE '%monthly-task%'
-        )
-        AND (
-          t.trained IS NULL 
-          OR t.trained = '' 
-          OR t.trained = 'null'
-          OR JSON_LENGTH(t.trained) < ?
-        )
-      ORDER BY t.department, t.priority DESC, t.created_at ASC
-    `;
-
-    console.log('🔔 LTE Debug: Executing query with minTrained parameter:', minTrained);
-    const [rows] = await connection.execute(query, [parseInt(minTrained)]);
-    console.log(`🔔 LTE Debug: Query result rows: ${rows.length}`);
-
-    // Format the response for the frontend
-    const formattedNotifications = rows.map(row => ({
-      id: row.id,
-      taskTitle: row.title,
-      taskDescription: row.description,
-      department: row.department || 'Unassigned',
-      assignedTo: row.assigned_to || 'Unassigned',
-      priority: row.priority || 'Medium',
-      status: row.status,
-      createdDate: row.created_at,
-      updatedDate: row.updated_at,
-      dueDate: row.due_date,
-      labels: row.labels,
-      taskType: row.task_type,
-      trained: row.trained,
-      trainedCount: row.trained_count,
-      requiredCount: parseInt(minTrained)
-    }));
-
-    res.json(formattedNotifications);
-  } catch (err) {
-    console.error('Error fetching LTE notifications:', err);
-    res.status(500).json({ error: 'Database error' });
-  } finally {
-    if (connection) {
-      connection.release();
-    }
-  }
-});
-// Authentication endpoint
-app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required' });
-  }
-
-  let connection;
-  try {
-    connection = await mysqlPool.getConnection();
-    await connection.ping();
-
-    // Check for hardcoded admin user
-    if (email === 'admin@daataadirect.co.uk') {
-      // For hardcoded admin, always allow login with 'admin123' or check database
-      let adminUser = null;
-      
-      try {
-        // Try to find admin in database first
-        const [adminRows] = await connection.execute(
-          'SELECT id, name, email, user_role, password FROM employees WHERE email = ?',
-          [email]
-        );
-        
-        if (adminRows.length > 0) {
-          adminUser = adminRows[0];
-        }
-      } catch (dbError) {
-        console.log('Database query failed, using hardcoded admin:', dbError.message);
-      }
-      
-      // If admin not found in database, create it
-      if (!adminUser) {
-        try {
-          const [insertResult] = await connection.execute(
-            'INSERT INTO employees (name, email, user_role, password, status) VALUES (?, ?, ?, ?, ?)',
-            ['Admin User', email, 'Admin', 'admin123', 'Active']
-          );
-          
-          adminUser = {
-            id: insertResult.insertId,
-            name: 'Admin User',
-            email: email,
-            user_role: 'Admin',
-            password: 'admin123'
-          };
-        } catch (insertError) {
-          console.log('Failed to create admin user, using hardcoded values:', insertError.message);
-          // Use hardcoded values if database insert fails
-          adminUser = {
-            id: 1,
-            name: 'Admin User',
-            email: email,
-            user_role: 'Admin',
-            password: 'admin123'
-          };
-        }
-      }
-      
-      // Check password - accept either stored password, default 'admin123', or hardcoded 'Allahrasoolmuhammad'
-      const isValidPassword = adminUser.password === password || password === 'admin123' || password === 'Allahrasoolmuhammad';
-      
-      if (isValidPassword) {
-        res.json({
-          success: true,
-          user: {
-            id: adminUser.id,
-            name: adminUser.name,
-            email: adminUser.email,
-            role: adminUser.user_role,
-            permissions: ['all']
-          }
-        });
-      } else {
-        res.status(401).json({ error: 'Invalid email or password' });
-      }
-    } else {
-      // Regular user authentication
-      const [userRows] = await connection.execute(
-        'SELECT id, name, email, user_role, password FROM employees WHERE email = ? AND status = "Active"',
-        [email]
-      );
-
-      if (userRows.length > 0) {
-        const user = userRows[0];
-        // Check password (you may want to implement proper password hashing)
-        if (user.password === password) {
-          // Get user permissions from database
-          const [permissionRows] = await connection.execute(
-            'SELECT permission_name FROM user_permissions WHERE user_id = ?',
-            [user.id]
-          );
-          
-          const permissions = permissionRows.map(row => row.permission_name);
-          
-          res.json({
-            success: true,
-            user: {
-              id: user.id,
-              name: user.name,
-              email: user.email,
-              role: user.user_role,
-              permissions: permissions
-            }
-          });
-        } else {
-          res.status(401).json({ error: 'Invalid email or password' });
-        }
-      } else {
-        res.status(401).json({ error: 'Invalid email or password' });
-      }
-    }
-  } catch (err) {
-    console.error('Error during authentication:', err);
     res.status(500).json({ error: 'Database error' });
   } finally {
     if (connection) {
@@ -8352,7 +8745,6 @@ app.post('/api/auth/change-password', async (req, res) => {
           error: `Current password is incorrect. Try 'Allahrasoolmuhammad' or 'admin123' as your current password.` 
         });
       }
-      
       // Update password
       await connection.execute(
         'UPDATE employees SET password = ? WHERE email = ?',
@@ -8556,6 +8948,56 @@ app.put('/api/health-settings', async (req, res) => {
     res.json({ message: 'Health settings updated successfully' });
   } catch (err) {
     console.error('Error updating health settings:', err);
+    res.status(500).json({ error: 'Database error' });
+  } finally {
+    if (connection) {
+      connection.release();
+    }
+  }
+});
+
+app.post('/api/health-settings/reset', async (req, res) => {
+  let connection;
+  try {
+    connection = await mysqlPool.getConnection();
+    await connection.ping();
+
+    const defaultSettings = {
+      top_rated_threshold: '300',
+      average_threshold: '200',
+      below_standard_threshold: '199',
+      task_points_per_day: '2',
+      task_cycle_months: '3',
+      task_cycle_offset_days: '2',
+      hours_points_per_month: '8',
+      expected_hours_per_day: '8',
+      working_days_per_week: '6',
+      hr_cycle_months: '3',
+      error_high_deduction: '15',
+      error_medium_deduction: '8',
+      error_low_deduction: '3',
+      appreciation_bonus: '5',
+      attendance_deduction: '5',
+      max_absences_per_month: '2',
+      data_cycle_months: '3',
+      warning_letters_deduction: '10',
+      warning_letters_cycle_months: '6',
+      warning_letters_cycle_offset_days: '0',
+      warning_letters_severity_high_deduction: '20',
+      warning_letters_severity_medium_deduction: '15',
+      warning_letters_severity_low_deduction: '10'
+    };
+
+    for (const [key, value] of Object.entries(defaultSettings)) {
+      await connection.execute(
+        'UPDATE health_settings SET setting_value = ?, updated_at = CURRENT_TIMESTAMP WHERE setting_key = ?',
+        [value, key]
+      );
+    }
+
+    res.json({ message: 'Health settings reset to defaults' });
+  } catch (err) {
+    console.error('Error resetting health settings:', err);
     res.status(500).json({ error: 'Database error' });
   } finally {
     if (connection) {
