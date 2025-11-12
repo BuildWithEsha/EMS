@@ -221,6 +221,9 @@ const initializeDatabaseTables = async () => {
   let connection;
   try {
     connection = await mysqlPool.getConnection();
+    await connection.query(
+      "SET SESSION sql_mode = (SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))"
+    );
     await connection.ping();
     
     // Create task_history table if it doesn't exist
@@ -358,6 +361,9 @@ app.get('/api/notices', async (req, res) => {
   let connection;
   try {
     connection = await mysqlPool.getConnection();
+    await connection.query(
+      "SET SESSION sql_mode = (SELECT REPLACE(@@sql_mode,'ONLY_FULL_GROUP_BY',''))"
+    );
     await connection.ping();
 
     let whereClause = '';
