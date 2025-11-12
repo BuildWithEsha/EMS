@@ -616,13 +616,9 @@ app.post('/api/notices', async (req, res) => {
     connection = await mysqlPool.getConnection();
     await connection.ping();
 
-    await connection.beginTransaction();
-
-    const normalizedStatus = (status || 'draft').toLowerCase();
-
-    const noticeQuery = `
-      INSERT INTO notices (title, description, priority, status, created_by)
-      VALUES (?, ?, ?, ?, ?)
+    const query = `
+      INSERT INTO notices (title, description, priority, status, recipients, attachments, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `;
     const [noticeResult] = await connection.execute(
       noticeQuery,
